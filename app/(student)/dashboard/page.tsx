@@ -2,6 +2,7 @@
 "use client";
 
 import { useSession } from "@/context/SessionContext";
+import Image from "next/image";
 
 // Mock data — swap for a real API call once available.
 const UPCOMING_EXAMS = [
@@ -66,7 +67,16 @@ export default function StudentDashboardPage() {
       <header className="fixed top-0 z-50 flex h-16 w-full items-center border-b border-border bg-background">
         <div className="mx-auto flex w-full max-w-container-max-width items-center justify-between px-margin-mobile md:px-margin-desktop">
           <div className="flex items-center gap-6">
-            <span className="font-display text-headline-md font-bold text-foreground">Proctoria Student Terminal</span>
+            <div className="flex items-center gap-2">
+              <Image
+                src="/logo-only-removebg-preview.png"
+                alt="Proctoria Logo"
+                width={28}
+                height={28}
+                className="h-7 w-7 rounded-full"
+              />
+              <span className="font-display text-headline-md font-bold text-foreground">Proctoria Student Terminal</span>
+            </div>
             <nav className="hidden items-center gap-gutter md:flex">
               <a href="/dashboard" className="border-b-2 border-primary pb-1 font-mono text-label-md font-bold text-primary">
                 Dashboard
