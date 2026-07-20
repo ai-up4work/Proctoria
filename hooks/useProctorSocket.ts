@@ -3,6 +3,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Ably from "ably";
+import { FlagCategory } from "@/lib/gaze";
 
 // Single shared channel for status/flag traffic between all students and
 // any proctor. Alerts go over per-student channels instead (see below) so
@@ -18,6 +19,13 @@ export interface RosterEntry {
   lastStatus: any;
 }
 
+export interface FlagEvent {
+  studentId: string;
+  message: string;
+  timestamp: number;
+  category: FlagCategory;
+}
+
 /**
  * clientId should be the logged-in user's stable id (studentId for
  * students, or any unique id for a proctor). The Ably client isn't created
@@ -29,7 +37,7 @@ export function useProctorSocket(clientId: string | null) {
 
   const [connected, setConnected] = useState(false);
   const [roster, setRoster] = useState<Map<string, RosterEntry>>(new Map());
-  const [events, setEvents] = useState<Array<{ studentId: string; message: string; timestamp: number }>>([]);
+  const [events, setEvents] = useState<FlagEvent[]>([]);
   const [alert, setAlert] = useState<{ message: string; timestamp: number } | null>(null);
 
   const [connectionError, setConnectionError] = useState<string | null>(null);
@@ -63,10 +71,17 @@ export function useProctorSocket(clientId: string | null) {
     };
   }, [clientId]);
 
+  // Guards against re-subscribing every time `connected` flips true->false->true
+  // on a reconnect, which previously caused duplicate event/flag/alert delivery.
+  const studentRegisteredRef = useRef(false);
+  const proctorRegisteredRef = useRef(false);
+
   const registerStudent = useCallback(
     (name?: string) => {
       const client = clientRef.current;
       if (!client || !clientId) return;
+      if (studentRegisteredRef.current) return;
+      studentRegisteredRef.current = true;
 
       const room = client.channels.get(ROOM_CHANNEL);
       roomRef.current = room;
@@ -84,6 +99,8 @@ export function useProctorSocket(clientId: string | null) {
   const registerProctor = useCallback(() => {
     const client = clientRef.current;
     if (!client) return;
+    if (proctorRegisteredRef.current) return;
+    proctorRegisteredRef.current = true;
 
     const room = client.channels.get(ROOM_CHANNEL);
     roomRef.current = room;
@@ -131,8 +148,8 @@ export function useProctorSocket(clientId: string | null) {
     });
 
     room.subscribe("flag", (msg) => {
-      const { studentId, message, timestamp } = msg.data;
-      setEvents((prev) => [{ studentId, message, timestamp }, ...prev].slice(0, 200));
+      const { studentId, message, timestamp, category } = msg.data as FlagEvent;
+      setEvents((prev) => [{ studentId, message, timestamp, category }, ...prev].slice(0, 200));
     });
   }, []);
 
@@ -140,9 +157,12 @@ export function useProctorSocket(clientId: string | null) {
     roomRef.current?.publish("status", { studentId, ...status });
   }, []);
 
-  const sendFlag = useCallback((studentId: string, message: string, timestamp: number) => {
-    roomRef.current?.publish("flag", { studentId, message, timestamp });
-  }, []);
+  const sendFlag = useCallback(
+    (studentId: string, message: string, timestamp: number, category: FlagCategory) => {
+      roomRef.current?.publish("flag", { studentId, message, timestamp, category });
+    },
+    []
+  );
 
   const sendAlert = useCallback((studentId: string, message: string) => {
     const client = clientRef.current;

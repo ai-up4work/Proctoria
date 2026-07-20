@@ -6,12 +6,14 @@ import { useParams } from "next/navigation";
 import { useSession } from "@/context/SessionContext";
 import { useGazeMonitor } from "@/hooks/useGazeMonitor";
 import { useProctorSocket } from "@/hooks/useProctorSocket";
-import type { DetectionResult } from "@/lib/gaze";
+import type { DetectionResult, FlagCategory } from "@/lib/gaze";
+import { FLAG_CATEGORY_META } from "@/lib/gaze";
 
 interface LogEntry {
   id: number;
   time: string;
   msg: string;
+  category: FlagCategory;
 }
 
 let logIdCounter = 0;
@@ -23,7 +25,7 @@ export default function StudentMonitorPage() {
 
   const { registerStudent, sendStatus, sendFlag, connected } = useProctorSocket(studentId);
   const [logs, setLogs] = useState<LogEntry[]>([
-    { id: 0, time: "--:--:--", msg: "Initial verification complete. Proctoring engine engaged." },
+    { id: 0, time: "--:--:--", msg: "Initial verification complete. Proctoring engine engaged.", category: "system" },
   ]);
   const [tabSwitches, setTabSwitches] = useState(0);
   const [syncLabel, setSyncLabel] = useState("Live Syncing…");
@@ -53,9 +55,17 @@ export default function StudentMonitorPage() {
     onFlag: (flag) => {
       logIdCounter += 1;
       setLogs((prev) =>
-        [{ id: logIdCounter, time: new Date().toLocaleTimeString([], { hour12: false }), msg: flag.message }, ...prev].slice(0, 60)
+        [
+          {
+            id: logIdCounter,
+            time: new Date().toLocaleTimeString([], { hour12: false }),
+            msg: flag.message,
+            category: flag.category,
+          },
+          ...prev,
+        ].slice(0, 60)
       );
-      sendFlag(studentId, flag.message, flag.timestamp);
+      sendFlag(studentId, flag.message, flag.timestamp, flag.category);
     },
   });
 
@@ -79,15 +89,21 @@ export default function StudentMonitorPage() {
         logIdCounter += 1;
         setLogs((prev) =>
           [
-            { id: logIdCounter, time: new Date().toLocaleTimeString([], { hour12: false }), msg: "Browser window lost focus." },
+            {
+              id: logIdCounter,
+              time: new Date().toLocaleTimeString([], { hour12: false }),
+              msg: "Browser window lost focus.",
+              category: "tab_switch" as FlagCategory,
+            },
             ...prev,
           ].slice(0, 60)
         );
+        sendFlag(studentId, "Browser window lost focus.", Date.now(), "tab_switch");
       }
     }
     document.addEventListener("visibilitychange", handleVisibility);
     return () => document.removeEventListener("visibilitychange", handleVisibility);
-  }, []);
+  }, [studentId, sendFlag]);
 
   const stateColor =
     result.state === "ok" ? "text-accent" : result.state === "warn" ? "text-primary" : "text-destructive";
@@ -303,23 +319,38 @@ export default function StudentMonitorPage() {
               <span className="font-body text-body-sm text-muted-foreground">{syncLabel}</span>
             </div>
             <div className="scrollbar-thin flex-1 space-y-base overflow-y-auto px-margin-mobile pb-margin-mobile md:px-margin-desktop md:pb-margin-desktop">
-              {logs.map((l) => (
-                <div
-                  key={l.id}
-                  className="flex items-center gap-gutter rounded-r-lg border-l-4 border-primary bg-card p-4"
-                >
-                  <div className="shrink-0 rounded bg-primary/10 p-2">
-                    <span className="material-symbols-outlined text-primary">eye_tracking</span>
-                  </div>
-                  <div className="min-w-0 flex-grow">
-                    <div className="flex justify-between gap-2">
-                      <span className="font-mono text-label-md text-primary">Flag</span>
-                      <span className="shrink-0 font-mono text-label-sm text-muted-foreground">{l.time}</span>
+              {logs.map((l) => {
+                const meta = FLAG_CATEGORY_META[l.category];
+                const borderColor =
+                  meta.severity === "critical"
+                    ? "border-destructive"
+                    : meta.severity === "warning"
+                    ? "border-secondary"
+                    : "border-primary";
+                const labelColor =
+                  meta.severity === "critical"
+                    ? "text-destructive"
+                    : meta.severity === "warning"
+                    ? "text-secondary"
+                    : "text-primary";
+                return (
+                  <div
+                    key={l.id}
+                    className={`flex items-center gap-gutter rounded-r-lg border-l-4 ${borderColor} bg-card p-4`}
+                  >
+                    <div className="shrink-0 rounded bg-primary/10 p-2">
+                      <span className="material-symbols-outlined text-primary">eye_tracking</span>
                     </div>
-                    <p className="break-words font-body text-body-sm text-foreground">{l.msg}</p>
+                    <div className="min-w-0 flex-grow">
+                      <div className="flex justify-between gap-2">
+                        <span className={`font-mono text-label-md ${labelColor}`}>{meta.label}</span>
+                        <span className="shrink-0 font-mono text-label-sm text-muted-foreground">{l.time}</span>
+                      </div>
+                      <p className="break-words font-body text-body-sm text-foreground">{l.msg}</p>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         </aside>

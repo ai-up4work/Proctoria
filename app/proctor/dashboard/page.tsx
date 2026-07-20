@@ -8,23 +8,27 @@ import {
   CalendarDays,
   CheckCircle2,
   ChevronRight,
+  Clipboard,
   Eye,
+  EyeOff,
   Flag,
   History,
   Info,
   Loader2,
   MessageCircle,
-  Mic,
   Plus,
   Radio,
+  RotateCcw,
   Send,
   Settings2,
   ShieldCheck,
+  SwitchCamera,
   Users,
   Wifi,
 } from "lucide-react";
 import { useSession } from "@/context/SessionContext";
 import { useProctorSocket } from "@/hooks/useProctorSocket";
+import { FLAG_CATEGORY_META, FlagCategory, FlagSeverity } from "@/lib/gaze";
 
 const NAV_ITEMS = [
   { label: "Live Proctoring", icon: Radio, active: true, link: "/proctor/dashboard" },
@@ -45,17 +49,16 @@ function severityOf(state: string | undefined): Severity {
   return "critical";
 }
 
-const SEVERITY_STYLES: Record<
-  Severity,
-  {
-    badgeBg: string;
-    badgeText: string;
-    border: string;
-    dot: string;
-    label: string;
-    icon: typeof CheckCircle2;
-  }
-> = {
+type SeverityStyle = {
+  badgeBg: string;
+  badgeText: string;
+  border: string;
+  dot: string;
+  label: string;
+  icon: typeof CheckCircle2;
+};
+
+const SEVERITY_STYLES: Record<Severity, SeverityStyle> = {
   critical: {
     badgeBg: "bg-destructive",
     badgeText: "text-background",
@@ -82,57 +85,42 @@ const SEVERITY_STYLES: Record<
   },
 };
 
-// Event Feed color-coding — classifies a raw flag/status message into a
-// severity bucket so the feed reads at a glance, same idea as the HTML
-// mockup's red/yellow/neutral feed items.
-type EventSeverity = "critical" | "warning" | "info";
+// Event Feed color-coding — driven entirely by the FlagCategory each event
+// carries (set at the source in useGazeMonitor / the tab-switch & clipboard
+// listeners), never by re-parsing the free-text message. This keeps color,
+// icon, and label permanently in sync with how the flag was actually
+// classified when it fired.
+const CATEGORY_ICONS: Record<FlagCategory, typeof Eye> = {
+  no_face: EyeOff,
+  multiple_faces: Users,
+  gaze_away: Eye,
+  head_away: RotateCcw,
+  tab_switch: SwitchCamera,
+  clipboard: Clipboard,
+  system: Info,
+};
 
-function classifyEvent(message: string): EventSeverity {
-  const m = message.toLowerCase();
-  const criticalKeywords = [
-    "multiple face",
-    "face not detected",
-    "no face",
-    "gaze away",
-    "away from screen",
-    "prohibited",
-    "object detected",
-    "device detected",
-    "unauthorized",
-  ];
-  const warningKeywords = ["tab", "focus", "copy/paste", "copy or paste", "audio", "mic", "clipboard"];
+type EventFeedStyle = {
+  border: string;
+  bg: string;
+  text: string;
+};
 
-  if (criticalKeywords.some((kw) => m.includes(kw))) return "critical";
-  if (warningKeywords.some((kw) => m.includes(kw))) return "warning";
-  return "info";
-}
-
-const EVENT_STYLES: Record<
-  EventSeverity,
-  {
-    border: string;
-    bg: string;
-    text: string;
-    icon: typeof Eye;
-  }
-> = {
+const SEVERITY_FEED_STYLES: Record<FlagSeverity, EventFeedStyle> = {
   critical: {
     border: "border-destructive",
     bg: "bg-destructive/10 hover:bg-destructive/20",
     text: "text-destructive",
-    icon: Eye,
   },
   warning: {
     border: "border-secondary",
     bg: "bg-secondary/10 hover:bg-secondary/20",
     text: "text-secondary",
-    icon: Mic,
   },
   info: {
     border: "border-border",
     bg: "bg-card/60 hover:bg-card",
     text: "text-muted-foreground",
-    icon: Info,
   },
 };
 
@@ -201,7 +189,7 @@ export default function ProctorDashboardPage() {
 
   const visibleEvents = events.filter(function passesFilter(e) {
     if (feedFilter === "all") return true;
-    return classifyEvent(e.message) !== "info";
+    return FLAG_CATEGORY_META[e.category].severity !== "info";
   });
 
   return (
@@ -470,25 +458,28 @@ export default function ProctorDashboardPage() {
 
         <div className="flex-1 overflow-y-auto scrollbar-thin p-4 space-y-3">
           {visibleEvents.map(function renderEvent(e, i) {
-            const severity = classifyEvent(e.message);
-            const styles = EVENT_STYLES[severity];
-            const EventIcon = styles.icon;
+            const meta = FLAG_CATEGORY_META[e.category];
+            const styles = SEVERITY_FEED_STYLES[meta.severity];
+            const EventIcon = CATEGORY_ICONS[e.category];
             return (
               <div
                 key={i}
                 className={`p-3 ${styles.bg} border-l-4 ${styles.border} rounded-r-lg cursor-pointer transition-colors`}
               >
                 <div className="flex justify-between items-start">
-                  <span
-                    className={`text-[10px] font-mono uppercase ${
-                      severity === "info" ? "text-muted-foreground" : styles.text
-                    }`}
-                  >
+                  <span className={`text-[10px] font-mono uppercase ${styles.text}`}>
                     {new Date(e.timestamp).toLocaleTimeString([], { hour12: false })}
                   </span>
                   <EventIcon className={`h-3.5 w-3.5 ${styles.text}`} />
                 </div>
-                <p className="mt-1 text-sm font-bold text-foreground">{e.studentId}</p>
+                <div className="mt-1 flex items-center gap-2">
+                  <p className="text-sm font-bold text-foreground">{e.studentId}</p>
+                  <span
+                    className={`rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-tight ${styles.bg} ${styles.text}`}
+                  >
+                    {meta.label}
+                  </span>
+                </div>
                 <p className="text-xs text-muted-foreground leading-tight">{e.message}</p>
               </div>
             );

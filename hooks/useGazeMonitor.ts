@@ -6,6 +6,7 @@ import {
   AWAY_TO_FLAG_MS,
   DetectionResult,
   EYE_OFFSET_LIMIT,
+  FlagCategory,
   GazeLabel,
   LEFT_EYE_CORNERS,
   LEFT_IRIS,
@@ -34,8 +35,8 @@ export interface GazeMonitorOptions {
     awayTime: number; // ms
     sessionTime: number; // ms
   }) => void;
-  /** Called only when a sustained attention-loss flag actually fires. */
-  onFlag?: (flag: { message: string; timestamp: number }) => void;
+  /** Called only when a sustained attention-loss flag actually fires, or a lifecycle event occurs. */
+  onFlag?: (flag: { message: string; timestamp: number; category: FlagCategory }) => void;
   /** If false, the video element is still required in the DOM (can be visually hidden) but no canvas overlay drawing happens. */
   drawOverlay?: boolean;
 }
@@ -71,8 +72,8 @@ export function useGazeMonitor(options: GazeMonitorOptions = {}) {
   const [flagCount, setFlagCount] = useState(0);
 
   const logEvent = useCallback(
-    (message: string) => {
-      onFlag?.({ message, timestamp: Date.now() });
+    (message: string, category: FlagCategory) => {
+      onFlag?.({ message, timestamp: Date.now(), category });
     },
     [onFlag]
   );
@@ -125,7 +126,12 @@ export function useGazeMonitor(options: GazeMonitorOptions = {}) {
     let result: DetectionResult;
     let metrics: GazeMetrics;
 
+    // Set whenever the current frame is NOT attentive, so the sustained-streak
+    // check below knows which FlagCategory to attach when it fires.
+    let awayCategory: FlagCategory | null = null;
+
     if (faces.length === 0) {
+      awayCategory = "no_face";
       metrics = { yaw: "–", pitch: "–", eye: "–", faces: "0" };
       result = {
         state: "bad",
@@ -136,6 +142,7 @@ export function useGazeMonitor(options: GazeMonitorOptions = {}) {
         confidence: 0,
       };
     } else if (faces.length > 1) {
+      awayCategory = "multiple_faces";
       reason = "Multiple faces detected in frame";
       metrics = { yaw: "–", pitch: "–", eye: "–", faces: String(faces.length) };
       result = {
@@ -167,7 +174,11 @@ export function useGazeMonitor(options: GazeMonitorOptions = {}) {
       confidence = Math.max(0, 1 - dev);
       attentive = dev < 1;
       gazeLabel = attentive ? "camera" : "away";
-      reason = headDev > eyeDev ? "Head turned away from camera" : "Eyes directed away from screen";
+
+      if (!attentive) {
+        awayCategory = headDev > eyeDev ? "head_away" : "gaze_away";
+        reason = headDev > eyeDev ? "Head turned away from camera" : "Eyes directed away from screen";
+      }
 
       result = {
         state: attentive ? "ok" : "warn",
@@ -184,11 +195,14 @@ export function useGazeMonitor(options: GazeMonitorOptions = {}) {
     if (!attentive) {
       if (awayStreakStartRef.current === null) awayStreakStartRef.current = now;
       const streak = now - awayStreakStartRef.current;
-      if (streak >= AWAY_TO_FLAG_MS && now - lastFlagAtRef.current > AWAY_TO_FLAG_MS) {
+      if (streak >= AWAY_TO_FLAG_MS && now - lastFlagAtRef.current > AWAY_TO_FLAG_MS && awayCategory) {
         flagCountRef.current += 1;
         lastFlagAtRef.current = now;
         setFlagCount(flagCountRef.current);
-        logEvent(`Sustained attention loss (${(streak / 1000).toFixed(1)}s) — ${reason || "no face"}`);
+        logEvent(
+          `Sustained attention loss (${(streak / 1000).toFixed(1)}s) — ${reason || "no face in frame"}`,
+          awayCategory
+        );
       }
     } else {
       awayStreakStartRef.current = null;
@@ -283,7 +297,7 @@ export function useGazeMonitor(options: GazeMonitorOptions = {}) {
     runningRef.current = true;
     setRunning(true);
     sessionStartRef.current = performance.now();
-    logEvent("Camera started — monitoring session begun.");
+    logEvent("Camera started — monitoring session begun.", "system");
     rafRef.current = requestAnimationFrame(loop);
   }, [logEvent]);
 
@@ -292,7 +306,7 @@ export function useGazeMonitor(options: GazeMonitorOptions = {}) {
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
     streamRef.current?.getTracks().forEach((t) => t.stop());
     setRunning(false);
-    logEvent("Camera stopped.");
+    logEvent("Camera stopped.", "system");
   }, [logEvent]);
 
   const reset = useCallback(() => {
@@ -302,7 +316,7 @@ export function useGazeMonitor(options: GazeMonitorOptions = {}) {
     lastFlagAtRef.current = 0;
     sessionStartRef.current = performance.now();
     setFlagCount(0);
-    logEvent("Session reset.");
+    logEvent("Session reset.", "system");
   }, [logEvent]);
 
   return {

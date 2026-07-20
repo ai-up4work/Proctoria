@@ -47,7 +47,7 @@ export default function ExamSitPage() {
       }
     },
     onFlag: (flag) => {
-      if (session) sendFlag(session.studentId, flag.message, flag.timestamp);
+      if (session) sendFlag(session.studentId, flag.message, flag.timestamp, flag.category);
     },
   });
 
@@ -74,7 +74,7 @@ export default function ExamSitPage() {
   useEffect(() => {
     function handleVisibility() {
       if (document.hidden && session) {
-        sendFlag(session.studentId, "Student switched tabs or minimized the window.", Date.now());
+        sendFlag(session.studentId, "Student switched tabs or minimized the window.", Date.now(), "tab_switch");
       }
     }
     document.addEventListener("visibilitychange", handleVisibility);
@@ -92,7 +92,7 @@ export default function ExamSitPage() {
     function blockClipboard(e: KeyboardEvent) {
       if ((e.ctrlKey || e.metaKey) && (e.key === "c" || e.key === "v")) {
         e.preventDefault();
-        if (session) sendFlag(session.studentId, "Attempted copy/paste while in terminal mode.", Date.now());
+        if (session) sendFlag(session.studentId, "Attempted copy/paste while in terminal mode.", Date.now(), "clipboard");
       }
     }
     document.addEventListener("keydown", blockClipboard);

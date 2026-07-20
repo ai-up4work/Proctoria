@@ -55,3 +55,42 @@ export interface DetectionResult {
   gazeLabel: GazeLabel;
   confidence: number;
 }
+
+// ---------------------------------------------------------------------------
+// Flag classification
+//
+// Every flag emitted anywhere in the app (gaze loop, tab-switch listener,
+// clipboard listener, lifecycle events) carries one of these categories.
+// This is the single source of truth for severity/color/label — the
+// dashboard's Event Feed should switch on `category`, never re-derive
+// severity by pattern-matching the free-text `message` string. Keeping the
+// classification here (next to the detection thresholds) instead of in the
+// dashboard component means the two can't drift out of sync again.
+// ---------------------------------------------------------------------------
+
+export type FlagCategory =
+  | "no_face"
+  | "multiple_faces"
+  | "gaze_away"
+  | "head_away"
+  | "tab_switch"
+  | "clipboard"
+  | "system";
+
+export type FlagSeverity = "critical" | "warning" | "info";
+
+export interface FlagCategoryMeta {
+  severity: FlagSeverity;
+  /** Short human-facing classification shown as a tag/chip in the feed. */
+  label: string;
+}
+
+export const FLAG_CATEGORY_META: Record<FlagCategory, FlagCategoryMeta> = {
+  no_face: { severity: "critical", label: "Face Not Visible" },
+  multiple_faces: { severity: "critical", label: "Multiple Faces" },
+  gaze_away: { severity: "critical", label: "Eyes Off Screen" },
+  head_away: { severity: "critical", label: "Head Turned Away" },
+  tab_switch: { severity: "warning", label: "Tab / Window Switch" },
+  clipboard: { severity: "warning", label: "Clipboard Attempt" },
+  system: { severity: "info", label: "System" },
+};
