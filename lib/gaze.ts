@@ -74,6 +74,7 @@ export type FlagCategory =
   | "gaze_away"
   | "head_away"
   | "tab_switch"
+  | "tab_away_prolonged"
   | "clipboard"
   | "system";
 
@@ -91,6 +92,12 @@ export const FLAG_CATEGORY_META: Record<FlagCategory, FlagCategoryMeta> = {
   gaze_away: { severity: "critical", label: "Eyes Off Screen" },
   head_away: { severity: "critical", label: "Head Turned Away" },
   tab_switch: { severity: "warning", label: "Tab / Window Switch" },
+  // Distinct from a plain tab_switch: this fires once an absence has run
+  // long enough that it's no longer "glanced away," it's "left the exam."
+  // Kept as its own category (rather than just louder tab_switch wording)
+  // so the dashboard's severity coloring escalates automatically instead
+  // of every tab-switch flag looking the same regardless of duration.
+  tab_away_prolonged: { severity: "critical", label: "Prolonged Absence" },
   clipboard: { severity: "warning", label: "Clipboard Attempt" },
   system: { severity: "info", label: "System" },
 };

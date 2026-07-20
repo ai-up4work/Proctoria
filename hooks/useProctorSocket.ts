@@ -17,6 +17,14 @@ export interface RosterEntry {
   name?: string;
   connected: boolean;
   lastStatus: any;
+  // Authoritative count of every flag this student has generated, from
+  // *any* source (gaze loop, tab-switch, clipboard, prolonged-absence
+  // escalation, etc). Maintained here — incremented directly off the
+  // "flag" channel — rather than read out of lastStatus.flagCount, which
+  // only ever reflected the gaze hook's own internal counter and gets
+  // clobbered whenever a status update without that field comes in (e.g.
+  // the synthetic "Tab Away" status pushed on visibilitychange).
+  flagCount: number;
 }
 
 export interface FlagEvent {
@@ -120,6 +128,7 @@ export function useProctorSocket(clientId: string | null) {
             name: m.data?.name,
             connected: true,
             lastStatus: existing?.lastStatus ?? null,
+            flagCount: existing?.flagCount ?? 0,
           });
         }
         for (const [id, entry] of next) {
@@ -142,6 +151,11 @@ export function useProctorSocket(clientId: string | null) {
           name: existing?.name,
           connected: existing?.connected ?? true,
           lastStatus: status,
+          // Status updates (including synthetic ones like "Tab Away" that
+          // don't carry their own flag telemetry) must never touch the
+          // flag count — that's tracked exclusively below, off the actual
+          // "flag" messages.
+          flagCount: existing?.flagCount ?? 0,
         });
         return next;
       });
@@ -150,6 +164,18 @@ export function useProctorSocket(clientId: string | null) {
     room.subscribe("flag", (msg) => {
       const { studentId, message, timestamp, category } = msg.data as FlagEvent;
       setEvents((prev) => [{ studentId, message, timestamp, category }, ...prev].slice(0, 200));
+      setRoster((prev) => {
+        const next = new Map(prev);
+        const existing = next.get(studentId);
+        next.set(studentId, {
+          studentId,
+          name: existing?.name,
+          connected: existing?.connected ?? true,
+          lastStatus: existing?.lastStatus ?? null,
+          flagCount: (existing?.flagCount ?? 0) + 1,
+        });
+        return next;
+      });
     });
   }, []);
 

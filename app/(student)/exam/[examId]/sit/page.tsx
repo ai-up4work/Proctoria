@@ -7,13 +7,37 @@ import { useGazeMonitor } from "@/hooks/useGazeMonitor";
 import { useProctorSocket } from "@/hooks/useProctorSocket";
 
 import { MOCK_QUESTIONS } from "@/lib/mockQuestions";
+import { FlagCategory } from "@/lib/gaze";
 
 const SESSION_SECONDS = 45 * 60;
 
-// How often to re-flag a student who is still away from the tab. Chosen to
-// be well above the browser's ~1s background-timer clamp so it fires
-// reliably even while backgrounded.
-const AWAY_REFLAG_MS = 10000;
+// Escalation ladder for a student who stays away from the exam tab.
+// The longer the absence runs, the more severe the category (which drives
+// the dashboard's red/amber coloring) and the tighter the re-flag interval
+// — a 5-second glance away shouldn't read the same as a 2-minute absence.
+// Intervals are chosen well above the browser's ~1s background-timer clamp
+// so they fire reliably even while the tab is backgrounded.
+const AWAY_TIERS: { afterSeconds: number; intervalMs: number; category: FlagCategory }[] = [
+  { afterSeconds: 0, intervalMs: 10000, category: "tab_switch" },
+  { afterSeconds: 30, intervalMs: 7000, category: "tab_away_prolonged" },
+  { afterSeconds: 90, intervalMs: 4000, category: "tab_away_prolonged" },
+];
+
+function tierFor(awaySeconds: number) {
+  let tier = AWAY_TIERS[0];
+  for (const t of AWAY_TIERS) {
+    if (awaySeconds >= t.afterSeconds) tier = t;
+  }
+  return tier;
+}
+
+function awayMessage(awaySeconds: number) {
+  if (awaySeconds < 30) return `Still away from the exam tab (${awaySeconds}s and counting).`;
+  if (awaySeconds < 90) return `Prolonged absence — away from the exam tab for ${awaySeconds}s. Escalating.`;
+  const m = Math.floor(awaySeconds / 60);
+  const s = awaySeconds % 60;
+  return `Extended absence — away from the exam tab for ${m}m ${s}s. Immediate review recommended.`;
+}
 
 function formatTime(totalSeconds: number) {
   const m = Math.floor(totalSeconds / 60);
@@ -89,8 +113,34 @@ export default function ExamSitPage() {
   useEffect(() => {
     if (!session) return;
 
-    let awayTimer: ReturnType<typeof setInterval> | null = null;
+    let awayTimeout: ReturnType<typeof setTimeout> | null = null;
     let hiddenSince: number | null = null;
+
+    function scheduleNextCheck() {
+      if (hiddenSince === null || !session) return;
+      const awaySeconds = Math.round((Date.now() - hiddenSince) / 1000);
+      const tier = tierFor(awaySeconds);
+
+      sendFlag(session.studentId, awayMessage(awaySeconds), Date.now(), tier.category);
+
+      // Once this crosses into the critical tier, push a status update too
+      // — not just a feed entry — so the student's card on the dashboard
+      // itself turns critical, in case the proctor isn't watching the feed.
+      if (tier.category === "tab_away_prolonged") {
+        sendStatus(session.studentId, {
+          result: {
+            state: "bad",
+            title: "Prolonged Absence",
+            sub: awayMessage(awaySeconds),
+            faceDetected: false,
+            gazeLabel: "unknown",
+            confidence: 0,
+          },
+        });
+      }
+
+      awayTimeout = setTimeout(scheduleNextCheck, tier.intervalMs);
+    }
 
     function handleVisibility() {
       if (!session) return;
@@ -114,20 +164,11 @@ export default function ExamSitPage() {
           },
         });
 
-        awayTimer = setInterval(() => {
-          if (hiddenSince === null) return;
-          const awaySeconds = Math.round((Date.now() - hiddenSince) / 1000);
-          sendFlag(
-            session.studentId,
-            `Still away from the exam tab (${awaySeconds}s and counting).`,
-            Date.now(),
-            "tab_switch"
-          );
-        }, AWAY_REFLAG_MS);
+        awayTimeout = setTimeout(scheduleNextCheck, AWAY_TIERS[0].intervalMs);
       } else {
-        if (awayTimer) {
-          clearInterval(awayTimer);
-          awayTimer = null;
+        if (awayTimeout) {
+          clearTimeout(awayTimeout);
+          awayTimeout = null;
         }
         if (hiddenSince !== null) {
           const awaySeconds = Math.round((Date.now() - hiddenSince) / 1000);
@@ -147,7 +188,7 @@ export default function ExamSitPage() {
     document.addEventListener("visibilitychange", handleVisibility);
     return () => {
       document.removeEventListener("visibilitychange", handleVisibility);
-      if (awayTimer) clearInterval(awayTimer);
+      if (awayTimeout) clearTimeout(awayTimeout);
     };
   }, [session, sendFlag, sendStatus]);
 
@@ -160,15 +201,51 @@ export default function ExamSitPage() {
   }, [errorMsg]);
 
   // Copy/paste restriction inside terminal mode.
+  //
+  // We deliberately listen on the "copy" / "paste" events themselves rather
+  // than keydown — clipboardData (the actual text) is only exposed on those
+  // events, and keydown also misses right-click "Paste" from the context
+  // menu. Content is truncated before being sent so a proctor reviewing the
+  // flag gets useful context without a giant blob landing in the feed.
   useEffect(() => {
-    function blockClipboard(e: KeyboardEvent) {
-      if ((e.ctrlKey || e.metaKey) && (e.key === "c" || e.key === "v")) {
-        e.preventDefault();
-        if (session) sendFlag(session.studentId, "Attempted copy/paste while in terminal mode.", Date.now(), "clipboard");
-      }
+    function truncate(text: string, max = 200) {
+      const trimmed = text.trim();
+      if (!trimmed) return "";
+      return trimmed.length <= max ? trimmed : trimmed.slice(0, max) + "…";
     }
-    document.addEventListener("keydown", blockClipboard);
-    return () => document.removeEventListener("keydown", blockClipboard);
+
+    function handleCopy(e: ClipboardEvent) {
+      if (!session) return;
+      e.preventDefault();
+      const selected = truncate(window.getSelection()?.toString() ?? "");
+      const preview = selected ? ` Captured text: "${selected}"` : " (could not capture selected text.)";
+      sendFlag(session.studentId, `Attempted to copy while in terminal mode.${preview}`, Date.now(), "clipboard");
+    }
+
+    function handleCut(e: ClipboardEvent) {
+      if (!session) return;
+      e.preventDefault();
+      const selected = truncate(window.getSelection()?.toString() ?? "");
+      const preview = selected ? ` Captured text: "${selected}"` : " (could not capture selected text.)";
+      sendFlag(session.studentId, `Attempted to cut while in terminal mode.${preview}`, Date.now(), "clipboard");
+    }
+
+    function handlePaste(e: ClipboardEvent) {
+      if (!session) return;
+      e.preventDefault();
+      const pasted = truncate(e.clipboardData?.getData("text/plain") ?? "");
+      const preview = pasted ? ` Captured content: "${pasted}"` : " (clipboard was empty or non-text.)";
+      sendFlag(session.studentId, `Attempted to paste while in terminal mode.${preview}`, Date.now(), "clipboard");
+    }
+
+    document.addEventListener("copy", handleCopy);
+    document.addEventListener("cut", handleCut);
+    document.addEventListener("paste", handlePaste);
+    return () => {
+      document.removeEventListener("copy", handleCopy);
+      document.removeEventListener("cut", handleCut);
+      document.removeEventListener("paste", handlePaste);
+    };
   }, [session, sendFlag]);
 
   const question = MOCK_QUESTIONS[current];

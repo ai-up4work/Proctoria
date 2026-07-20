@@ -49,6 +49,7 @@ const ALL_CATEGORIES: FlagCategory[] = [
   "gaze_away",
   "head_away",
   "tab_switch",
+  "tab_away_prolonged",
   "clipboard",
   "system",
 ];
@@ -116,6 +117,7 @@ const CATEGORY_ICONS: Record<FlagCategory, typeof Eye> = {
   gaze_away: Eye,
   head_away: RotateCcw,
   tab_switch: SwitchCamera,
+  tab_away_prolonged: AlertTriangle,
   clipboard: Clipboard,
   system: Info,
 };
@@ -152,6 +154,11 @@ export default function ProctorDashboardPage() {
   );
   const [alertDrafts, setAlertDrafts] = useState<Record<string, string>>({});
   const [justSent, setJustSent] = useState<Record<string, boolean>>({});
+  // Tracks which event-feed entries the proctor has clicked open to read in
+  // full. Keyed by studentId+timestamp (stable across re-renders) rather
+  // than array index, since new events are prepended and would otherwise
+  // shift which card a given index points at.
+  const [expandedEvents, setExpandedEvents] = useState<Set<string>>(new Set());
 
   // Event feed filters
   const [studentFilter, setStudentFilter] = useState<string>("all");
@@ -198,6 +205,15 @@ export default function ProctorDashboardPage() {
     });
   }
 
+  function toggleEventExpanded(key: string) {
+    setExpandedEvents((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
   function clearFilters() {
     setStudentFilter("all");
     setSeverityFilter("all");
@@ -226,7 +242,7 @@ export default function ProctorDashboardPage() {
     );
   }
 
-  const flaggedCount = roster.reduce((sum, s) => sum + (s.lastStatus?.flagCount ?? 0), 0);
+  const flaggedCount = roster.reduce((sum, s) => sum + s.flagCount, 0);
 
   const visibleEvents = events.filter(function passesFilter(e) {
     if (studentFilter !== "all" && e.studentId !== studentFilter) return false;
@@ -356,7 +372,7 @@ export default function ProctorDashboardPage() {
               const severity = severityOf(state);
               const styles = SEVERITY_STYLES[severity];
               const CardIcon = styles.icon;
-              const flagCount = s.lastStatus?.flagCount ?? 0;
+              const flagCount = s.flagCount;
               const monitorHref = "/monitor/" + s.studentId;
 
               return (
@@ -599,10 +615,17 @@ export default function ProctorDashboardPage() {
             const meta = FLAG_CATEGORY_META[e.category];
             const styles = SEVERITY_FEED_STYLES[meta.severity];
             const EventIcon = CATEGORY_ICONS[e.category];
+            const key = `${e.studentId}-${e.timestamp}-${i}`;
+            const isLong = e.message.length > 90;
+            const expanded = expandedEvents.has(key);
+            const displayMessage = isLong && !expanded ? e.message.slice(0, 90).trimEnd() + "…" : e.message;
             return (
               <div
-                key={i}
-                className={`p-3 ${styles.bg} border-l-4 ${styles.border} rounded-r-lg cursor-pointer transition-colors`}
+                key={key}
+                onClick={() => isLong && toggleEventExpanded(key)}
+                className={`p-3 ${styles.bg} border-l-4 ${styles.border} rounded-r-lg transition-colors ${
+                  isLong ? "cursor-pointer" : "cursor-default"
+                }`}
               >
                 <div className="flex justify-between items-start">
                   <span className={`text-[10px] font-mono uppercase ${styles.text}`}>
@@ -618,7 +641,19 @@ export default function ProctorDashboardPage() {
                     {meta.label}
                   </span>
                 </div>
-                <p className="text-xs text-muted-foreground leading-tight">{e.message}</p>
+                <p className="text-xs text-muted-foreground leading-tight break-words">{displayMessage}</p>
+                {isLong && (
+                  <button
+                    type="button"
+                    onClick={(ev) => {
+                      ev.stopPropagation();
+                      toggleEventExpanded(key);
+                    }}
+                    className={`mt-1 text-[10px] font-bold uppercase tracking-wide ${styles.text} underline decoration-dotted`}
+                  >
+                    {expanded ? "Show less" : "Click to view full text"}
+                  </button>
+                )}
               </div>
             );
           })}
@@ -637,6 +672,13 @@ export default function ProctorDashboardPage() {
               No events yet.
             </div>
           )}
+        </div>
+
+        <div className="p-6 border-t border-sidebar-border">
+          <button className="w-full py-3 bg-muted text-foreground font-bold text-sm rounded-lg border border-border hover:bg-muted/70 transition-all flex items-center justify-center gap-2">
+            <History className="h-4 w-4" />
+            <span>Session Archive</span>
+          </button>
         </div>
       </aside>
     </div>
