@@ -6,12 +6,7 @@ import { useSession } from "@/context/SessionContext";
 import { useGazeMonitor } from "@/hooks/useGazeMonitor";
 import { useProctorSocket } from "@/hooks/useProctorSocket";
 
-// Replace with your real question set / API call.
-const MOCK_QUESTIONS = [
-  { id: "q1", text: "What is the time complexity of binary search?", options: ["O(n)", "O(log n)", "O(n log n)", "O(1)"] },
-  { id: "q2", text: "Which HTTP method is idempotent?", options: ["POST", "PUT", "PATCH", "CONNECT"] },
-  { id: "q3", text: "React hooks must be called…", options: ["Conditionally", "Inside loops", "At the top level", "Inside classes"] },
-];
+import { MOCK_QUESTIONS } from "@/lib/mockQuestions";
 
 const SESSION_SECONDS = 45 * 60;
 
@@ -33,7 +28,7 @@ export default function ExamSitPage() {
   const [banner, setBanner] = useState<{ message: string; timestamp: number } | null>(null);
   const [secondsLeft, setSecondsLeft] = useState(SESSION_SECONDS);
 
-  const { videoRef, start, running, modelReady } = useGazeMonitor({
+  const { videoRef, start, running, modelReady, modelStatus, errorMsg } = useGazeMonitor({
     // drawOverlay left false — this page never shows the feed to the student
     onStatus: (status) => {
       if (session) {
@@ -81,11 +76,13 @@ export default function ExamSitPage() {
     return () => document.removeEventListener("visibilitychange", handleVisibility);
   }, [session, sendFlag]);
 
-  // Session countdown.
+  // Session countdown — paused while monitoring is blocked (camera error),
+  // so a student can't run the clock out by denying camera access.
   useEffect(() => {
+    if (errorMsg) return;
     const id = setInterval(() => setSecondsLeft((s) => Math.max(0, s - 1)), 1000);
     return () => clearInterval(id);
-  }, []);
+  }, [errorMsg]);
 
   // Copy/paste restriction inside terminal mode.
   useEffect(() => {
@@ -123,6 +120,12 @@ export default function ExamSitPage() {
     }
   }
 
+  function retryCamera() {
+    // start() itself no-ops if already running, and re-requests getUserMedia
+    // on the next call since runningRef will still be false after a failure.
+    start();
+  }
+
   if (!session) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background text-body-sm text-muted-foreground">
@@ -135,6 +138,36 @@ export default function ExamSitPage() {
     <div className="min-h-screen bg-background font-body text-foreground">
       {/* Hidden video element — camera runs, nothing rendered to the student. */}
       <video ref={videoRef} autoPlay playsInline muted className="hidden" />
+
+      {/* Blocking overlay — camera/model failure. The exam is not usable
+          until monitoring is restored, so a student can't silently continue
+          unproctored. */}
+      {errorMsg && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-background/95 p-6 backdrop-blur-md">
+          <div className="w-full max-w-md rounded-xl border border-destructive/40 bg-card p-8 text-center shadow-2xl">
+            <span
+              className="material-symbols-outlined mb-4 text-4xl text-destructive"
+              style={{ fontVariationSettings: "'FILL' 1" }}
+            >
+              videocam_off
+            </span>
+            <h2 className="mb-2 font-display text-headline-md font-bold text-foreground">
+              Monitoring Interrupted
+            </h2>
+            <p className="mb-6 font-body text-body-sm text-muted-foreground">{errorMsg}</p>
+            <p className="mb-6 font-mono text-label-sm text-muted-foreground">
+              Camera access is required for the duration of this exam. Please allow camera permissions in your
+              browser and try again.
+            </p>
+            <button
+              onClick={retryCamera}
+              className="w-full rounded-lg bg-primary px-6 py-3 font-mono text-label-md font-bold text-primary-foreground transition-all hover:brightness-110 active:scale-95"
+            >
+              Retry Camera Access
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Top app bar */}
       <header className="fixed top-0 z-50 flex h-16 w-full items-center border-b border-border bg-background">
@@ -158,23 +191,23 @@ export default function ExamSitPage() {
             {/* Monitor status indicator */}
             <div
               className={`hidden items-center gap-2 rounded-full border px-3 py-1.5 sm:flex ${
-                connectionError ? "border-destructive/30 bg-destructive/10" : "border-accent/20 bg-muted"
+                connectionError || errorMsg ? "border-destructive/30 bg-destructive/10" : "border-accent/20 bg-muted"
               }`}
             >
               <span
                 className={`material-symbols-outlined text-sm ${
-                  connectionError ? "text-destructive" : "animate-pulse text-accent"
+                  connectionError || errorMsg ? "text-destructive" : "animate-pulse text-accent"
                 }`}
                 style={{ fontVariationSettings: "'FILL' 1" }}
               >
-                {connectionError ? "wifi_off" : "wifi_tethering"}
+                {errorMsg ? "videocam_off" : connectionError ? "wifi_off" : "wifi_tethering"}
               </span>
               <span
                 className={`font-mono text-label-sm uppercase tracking-widest ${
-                  connectionError ? "text-destructive" : "text-accent"
+                  connectionError || errorMsg ? "text-destructive" : "text-accent"
                 }`}
               >
-                {connectionError ? "Monitor Offline" : running ? "Monitor Synced" : "Connecting…"}
+                {errorMsg ? "Camera Error" : connectionError ? "Monitor Offline" : running ? "Monitor Synced" : modelStatus || "Connecting…"}
               </span>
             </div>
 
@@ -244,8 +277,13 @@ export default function ExamSitPage() {
           </div>
         </div>
 
-        {/* Question area */}
-        <div className="grid flex-grow grid-cols-12 gap-gutter">
+        {/* Question area — disabled while camera monitoring is down */}
+        <div
+          className={`grid flex-grow grid-cols-12 gap-gutter transition-opacity ${
+            errorMsg ? "pointer-events-none opacity-40" : ""
+          }`}
+          aria-hidden={Boolean(errorMsg)}
+        >
           {/* Main question container */}
           <div className="col-span-12 flex flex-col gap-gutter lg:col-span-8">
             <div className="rounded-lg border border-border bg-card p-6 md:p-10">
@@ -287,80 +325,48 @@ export default function ExamSitPage() {
             </div>
           </div>
 
-          {/* Sidebar / References */}
+          {/* Sidebar: compact integrity indicators + navigation map filling the rest */}
           <aside className="col-span-12 flex flex-col gap-gutter lg:col-span-4">
-            {/* Guidelines */}
-            <div className="rounded-lg border border-border bg-card/50 p-6">
-              <div className="mb-4 flex items-center gap-2">
-                <span className="material-symbols-outlined text-sm text-primary">info</span>
-                <h3 className="font-mono text-label-md uppercase tracking-widest text-primary">
-                  Question Guidelines
-                </h3>
-              </div>
-              <ul className="space-y-3 font-body text-body-sm text-muted-foreground">
-                <li className="flex gap-2">
-                  <span className="text-primary">•</span> Read each option carefully before selecting.
-                </li>
-                <li className="flex gap-2">
-                  <span className="text-primary">•</span> You can flag a question and return to it later.
-                </li>
-                <li className="flex gap-2">
-                  <span className="text-primary">•</span> Answers auto-save as you navigate.
-                </li>
-              </ul>
+            {/* Integrity indicators — compact status strip, not a block */}
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-lg border border-border bg-card/50 px-4 py-3">
+              <span className="flex items-center gap-1.5 font-mono text-label-sm text-muted-foreground">
+                <span className={`h-1.5 w-1.5 rounded-full ${connected ? "bg-accent" : "bg-destructive"}`} />
+                Network {connected ? "Stable" : "Down"}
+              </span>
+              <span className="flex items-center gap-1.5 font-mono text-label-sm text-muted-foreground">
+                <span className="h-1.5 w-1.5 rounded-full bg-accent" />
+                Lockdown Active
+              </span>
+              <span className="flex items-center gap-1.5 font-mono text-label-sm text-muted-foreground">
+                <span
+                  className={`h-1.5 w-1.5 rounded-full ${
+                    errorMsg ? "bg-destructive" : running ? "bg-accent" : "bg-muted-foreground"
+                  }`}
+                />
+                Camera {errorMsg ? "Error" : running ? "Active" : "Starting"}
+              </span>
+              <span className="flex items-center gap-1.5 font-mono text-label-sm text-muted-foreground">
+                <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground" />
+                Peripherals None
+              </span>
             </div>
 
-            {/* Integrity log */}
-            <div className="rounded-lg border border-border bg-card/50 p-6">
-              <div className="mb-4 flex items-center gap-2">
-                <span className="material-symbols-outlined text-sm text-accent">verified_user</span>
-                <h3 className="font-mono text-label-md uppercase tracking-widest text-accent">Integrity Log</h3>
-              </div>
-              <div className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <span className="text-body-sm text-muted-foreground">Network Stability</span>
-                  <span className="rounded bg-accent/15 px-2 py-0.5 font-mono text-label-sm text-accent">
-                    {connected ? "STABLE" : "DOWN"}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-body-sm text-muted-foreground">Browser Lockdown</span>
-                  <span className="rounded bg-accent/15 px-2 py-0.5 font-mono text-label-sm text-accent">ACTIVE</span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-body-sm text-muted-foreground">Camera Monitor</span>
-                  <span
-                    className={`rounded px-2 py-0.5 font-mono text-label-sm ${
-                      running ? "bg-accent/15 text-accent" : "bg-muted text-muted-foreground"
-                    }`}
-                  >
-                    {running ? "ACTIVE" : "STARTING"}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-body-sm text-muted-foreground">Peripheral Check</span>
-                  <span className="rounded bg-muted px-2 py-0.5 font-mono text-label-sm text-muted-foreground">
-                    NONE
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            {/* Navigation map — bento-style tiles */}
-            <div className="flex flex-col gap-2">
-              <h3 className="px-1 font-mono text-label-sm uppercase tracking-widest text-muted-foreground">
+            {/* Navigation map — fills the remaining height so this column always
+                matches the question panel's height, regardless of question count. */}
+            <div className="flex flex-1 flex-col gap-3 rounded-lg border border-border bg-card/50 p-6">
+              <h3 className="font-mono text-label-sm uppercase tracking-widest text-muted-foreground">
                 Navigation Map
               </h3>
-              <div className="grid grid-cols-5 gap-2">
+              <div className="grid flex-1 auto-rows-fr grid-cols-6 gap-1.5">
                 {MOCK_QUESTIONS.map((q, i) => {
                   const isCurrent = i === current;
                   const isFlagged = flagged.has(q.id);
                   const isDone = Boolean(answers[q.id]);
 
                   let cellClasses =
-                    "flex h-10 items-center justify-center rounded font-mono text-label-md transition-all";
+                    "flex items-center justify-center rounded font-mono text-label-sm transition-all";
                   if (isCurrent) {
-                    cellClasses += " scale-110 z-10 bg-primary text-primary-foreground border-2 border-primary shadow-[0_0_10px_hsl(var(--primary)/0.3)]";
+                    cellClasses += " scale-105 z-10 bg-primary text-primary-foreground border-2 border-primary shadow-[0_0_10px_hsl(var(--primary)/0.3)]";
                   } else if (isFlagged) {
                     cellClasses += " bg-destructive/15 text-destructive border border-destructive/30";
                   } else if (isDone) {
@@ -373,7 +379,7 @@ export default function ExamSitPage() {
                     <button key={q.id} type="button" onClick={() => goTo(i)} className={cellClasses}>
                       {isFlagged ? (
                         <span
-                          className="material-symbols-outlined text-[14px]"
+                          className="material-symbols-outlined text-[13px]"
                           style={{ fontVariationSettings: "'FILL' 1" }}
                         >
                           flag
@@ -390,8 +396,13 @@ export default function ExamSitPage() {
         </div>
       </main>
 
-      {/* Bottom navigation bar */}
-      <footer className="fixed bottom-0 z-50 flex h-20 w-full items-center border-t border-border bg-card/90 backdrop-blur-xl">
+      {/* Bottom navigation bar — disabled while camera monitoring is down */}
+      <footer
+        className={`fixed bottom-0 z-50 flex h-20 w-full items-center border-t border-border bg-card/90 backdrop-blur-xl transition-opacity ${
+          errorMsg ? "pointer-events-none opacity-40" : ""
+        }`}
+        aria-hidden={Boolean(errorMsg)}
+      >
         <div className="mx-auto flex w-full max-w-container-max-width items-center justify-between px-margin-mobile md:px-margin-desktop">
           <button
             disabled={current === 0}
