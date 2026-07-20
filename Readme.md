@@ -50,3 +50,6 @@ pages, API routes, and realtime — deploys as one Vercel project.
   maps back into your MSc report.
 - Ably's free tier has message/connection limits — fine for a class demo,
   check their pricing page before using this for a real cohort.
+
+First login as students 
+then login as proctor
