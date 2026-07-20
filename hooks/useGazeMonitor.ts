@@ -36,9 +36,41 @@ export interface GazeMonitorOptions {
     sessionTime: number; // ms
   }) => void;
   /** Called only when a sustained attention-loss flag actually fires, or a lifecycle event occurs. */
-  onFlag?: (flag: { message: string; timestamp: number; category: FlagCategory }) => void;
+  onFlag?: (flag: {
+    message: string;
+    timestamp: number;
+    category: FlagCategory;
+    /** JPEG data URL captured from the live webcam frame at the moment the flag fired, if available. */
+    snapshot?: string;
+  }) => void;
   /** If false, the video element is still required in the DOM (can be visually hidden) but no canvas overlay drawing happens. */
   drawOverlay?: boolean;
+  /** If false, flag events fire without a snapshot attached. Defaults to true. */
+  captureSnapshots?: boolean;
+  /** JPEG quality (0–1) for captured snapshots. Defaults to 0.7. */
+  snapshotQuality?: number;
+}
+
+/**
+ * Grabs the current frame from a playing <video> element and returns it as a
+ * JPEG data URL. Returns null if the video has no dimensions yet (not loaded
+ * / not playing) or canvas context creation fails.
+ */
+function captureVideoFrame(video: HTMLVideoElement | null, quality = 0.7): string | null {
+  if (!video || !video.videoWidth || !video.videoHeight) return null;
+  const canvas = document.createElement("canvas");
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  try {
+    return canvas.toDataURL("image/jpeg", quality);
+  } catch {
+    // toDataURL can throw on a tainted canvas (e.g. cross-origin video source).
+    // The webcam stream is same-origin/local, so this should not normally happen.
+    return null;
+  }
 }
 
 /**
@@ -49,7 +81,13 @@ export interface GazeMonitorOptions {
  * entirely on pages where the feed is never shown to the student).
  */
 export function useGazeMonitor(options: GazeMonitorOptions = {}) {
-  const { onStatus, onFlag, drawOverlay = false } = options;
+  const {
+    onStatus,
+    onFlag,
+    drawOverlay = false,
+    captureSnapshots = true,
+    snapshotQuality = 0.7,
+  } = options;
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -72,8 +110,8 @@ export function useGazeMonitor(options: GazeMonitorOptions = {}) {
   const [flagCount, setFlagCount] = useState(0);
 
   const logEvent = useCallback(
-    (message: string, category: FlagCategory) => {
-      onFlag?.({ message, timestamp: Date.now(), category });
+    (message: string, category: FlagCategory, snapshot?: string) => {
+      onFlag?.({ message, timestamp: Date.now(), category, snapshot });
     },
     [onFlag]
   );
@@ -199,9 +237,18 @@ export function useGazeMonitor(options: GazeMonitorOptions = {}) {
         flagCountRef.current += 1;
         lastFlagAtRef.current = now;
         setFlagCount(flagCountRef.current);
+
+        // Capture the current webcam frame at the moment the flag fires —
+        // covers head_away, gaze_away, no_face, and multiple_faces alike,
+        // since they all funnel through this same sustained-streak check.
+        const snapshot = captureSnapshots
+          ? captureVideoFrame(videoRef.current, snapshotQuality) ?? undefined
+          : undefined;
+
         logEvent(
           `Sustained attention loss (${(streak / 1000).toFixed(1)}s) — ${reason || "no face in frame"}`,
-          awayCategory
+          awayCategory,
+          snapshot
         );
       }
     } else {
