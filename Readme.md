@@ -1,50 +1,52 @@
-# Proctoria — multi-page structure
+# Proctoria — single-deployment (Vercel + Ably)
 
-## What changed vs. the single-page version
-- Detection math + constants → `lib/gaze.ts` (pure, testable)
-- Monitoring logic → `hooks/useGazeMonitor.ts` (headless-capable: video element
-  can be hidden, canvas overlay is optional via `drawOverlay`)
-- Real-time transport → `hooks/useProctorSocket.ts` + `server/ws-server.js`
-- Mock ID login + session → `context/SessionContext.tsx`, `app/login/page.tsx`
+## Why Ably instead of raw `ws`
+Vercel doesn't run a persistent Node process, so a self-hosted WebSocket
+server (`ws-server.js`) can't live inside a Vercel deployment — it needs a
+separate always-on host. Ably is a managed realtime service that Next.js
+talks to over regular HTTP/serverless functions, so the *whole* app —
+pages, API routes, and realtime — deploys as one Vercel project.
 
-## Pages
+## What changed
+- Removed `server/ws-server.js` entirely.
+- Added `app/api/ably-token/route.ts` — a serverless route that mints a
+  short-lived Ably token per client. This keeps your Ably API key server-side
+  only; the browser never sees it.
+- Rewrote `hooks/useProctorSocket.ts` to use the `ably` SDK:
+  - One shared channel `proctoring-room` carries `status` and `flag`
+    messages from every student, and Ably **Presence** on that channel is
+    used to build the live roster (who's connected) — no manual
+    connect/disconnect bookkeeping needed.
+  - Per-student channels `alert-{studentId}` carry proctor → student
+    alerts. Because each student only ever subscribes to their *own*
+    alert channel, "only this student sees this alert" is enforced by
+    Ably's channel model — no server-side routing code required.
+
+## Setup
+1. `npm install ably`
+2. Create an Ably account (free tier is enough for this), grab an API key.
+3. In Vercel project settings (and `.env.local` for dev), set:
+   ```
+   ABLY_API_KEY=your-key-here
+   ```
+   Do **not** prefix it with `NEXT_PUBLIC_` — it must stay server-side,
+   only `app/api/ably-token/route.ts` reads it.
+4. `next dev` (or deploy to Vercel as usual) — no second process to run.
+
+## Pages (unchanged from before)
 | Route | Who | Camera shown? | Purpose |
 |---|---|---|---|
 | `/login` | everyone | no | mock ID-number sign-in, picks role |
-| `/exam/[examId]/sit` | student | **no** (hidden `<video>`, monitoring still runs) | the actual exam, questions only, only this student's alerts appear |
-| `/monitor/[studentId]` | student (own link) | yes | reference view of their own camera + flags, shareable link |
-| `/proctor/dashboard` | proctor | no (links out to each student's feed) | roster of all students, live cross-student event feed, send a targeted alert to any one student |
+| `/exam/[examId]/sit` | student | **no** | questions only; monitoring runs headlessly; only this student's alerts appear |
+| `/monitor/[studentId]` | student (own link) | yes | reference view of their own camera + flags |
+| `/proctor/dashboard` | proctor | no | roster of all students, combined event feed, send a targeted alert to any one student |
 
-## Running it
-1. `npm install ws` (server) and make sure `@mediapipe/tasks-vision`, `lucide-react`
-   are already in your app's `package.json`.
-2. Start the WebSocket hub as its own process:
-   ```
-   node server/ws-server.js
-   ```
-   (Next.js's default server can't host a raw `ws` connection without a custom
-   server, so this stays separate — point `NEXT_PUBLIC_WS_URL` at wherever you
-   deploy it, e.g. a small Fly.io/Render process, in production.)
-3. Run your Next.js app as usual. Set `NEXT_PUBLIC_WS_URL=ws://localhost:8080`
-   in `.env.local` for local dev.
-
-## Fixes folded in from the review
-- Multi-face branch now sets a real `reason` string instead of silently
-  logging "no face" (bug in the original).
-- Tab-switch / window-blur detection added on the exam page via
-  `visibilitychange`, flagged the same way as gaze events.
-- Global styles (`html, body` background) should move to `app/globals.css`
-  instead of `<style jsx global>` inside a single page — otherwise they'll
-  leak onto `/login`, `/proctor/dashboard`, etc. once you have more than one
-  route.
-
-## Known gaps worth calling out (also good material for your dissertation's
-## limitations section, since detection is 100% client-side)
-- No server-side verification of flags — a modified client could fake
-  "Verified" forever. Fine for a demo; call it out explicitly if this maps to
-  your MSc write-up.
-- `ws-server.js` keeps roster/state in memory only — fine for a class demo,
-  not for production (add persistence + auth on the socket itself before any
-  real deployment).
-- No fullscreen enforcement yet — logical next addition alongside the
-  tab-switch detection.
+## Notes / gaps worth knowing about
+- `useProctorSocket(clientId)` now takes the logged-in user's id up front —
+  the Ably client and its auth token are bound to that id, so it can't be
+  constructed until a session exists.
+- Detection is still 100% client-side — a modified client could fake
+  "Verified" indefinitely. Worth naming explicitly as a limitation if this
+  maps back into your MSc report.
+- Ably's free tier has message/connection limits — fine for a class demo,
+  check their pricing page before using this for a real cohort.

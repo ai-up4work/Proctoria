@@ -32,6 +32,8 @@ export function useProctorSocket(clientId: string | null) {
   const [events, setEvents] = useState<Array<{ studentId: string; message: string; timestamp: number }>>([]);
   const [alert, setAlert] = useState<{ message: string; timestamp: number } | null>(null);
 
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+
   // One Ably connection per mounted page, torn down on unmount / clientId change.
   useEffect(() => {
     if (!clientId) return;
@@ -42,9 +44,18 @@ export function useProctorSocket(clientId: string | null) {
     });
     clientRef.current = client;
 
-    client.connection.on("connected", () => setConnected(true));
+    client.connection.on("connected", () => {
+      setConnected(true);
+      setConnectionError(null);
+    });
     client.connection.on("disconnected", () => setConnected(false));
     client.connection.on("suspended", () => setConnected(false));
+    client.connection.on("failed", (stateChange) => {
+      setConnected(false);
+      const reason = stateChange.reason?.message || "Ably connection failed";
+      setConnectionError(reason);
+      console.error("Ably connection failed:", stateChange.reason);
+    });
 
     return () => {
       client.close();
@@ -143,6 +154,7 @@ export function useProctorSocket(clientId: string | null) {
 
   return {
     connected,
+    connectionError,
     roster: Array.from(roster.values()),
     events,
     alert,

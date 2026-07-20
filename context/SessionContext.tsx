@@ -11,6 +11,11 @@ export interface Session {
 
 interface SessionContextValue {
   session: Session | null;
+  /** True until the sessionStorage restore attempt has run once. Consumers
+   *  that redirect based on session presence (e.g. the root page) should
+   *  wait for this to be false before deciding "no session" means logged out
+   *  — otherwise a refresh can bounce a logged-in user to /login for a beat. */
+  initializing: boolean;
   login: (studentId: string, name: string, role?: "student" | "proctor") => void;
   logout: () => void;
 }
@@ -21,6 +26,7 @@ const STORAGE_KEY = "proctoria.session";
 
 export function SessionProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
+  const [initializing, setInitializing] = useState(true);
 
   // Restore session on refresh so a student doesn't get bounced mid-exam.
   useEffect(() => {
@@ -32,6 +38,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         /* ignore corrupt value */
       }
     }
+    setInitializing(false);
   }, []);
 
   const login = (studentId: string, name: string, role: "student" | "proctor" = "student") => {
@@ -45,7 +52,9 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     sessionStorage.removeItem(STORAGE_KEY);
   };
 
-  return <SessionContext.Provider value={{ session, login, logout }}>{children}</SessionContext.Provider>;
+  return (
+    <SessionContext.Provider value={{ session, initializing, login, logout }}>{children}</SessionContext.Provider>
+  );
 }
 
 export function useSession() {

@@ -1,8 +1,7 @@
 // app/exam/[examId]/sit/page.tsx
 "use client";
 
-import { useEffect, useState } from "react";
-import { AlertTriangle, X } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 import { useSession } from "@/context/SessionContext";
 import { useGazeMonitor } from "@/hooks/useGazeMonitor";
 import { useProctorSocket } from "@/hooks/useProctorSocket";
@@ -14,15 +13,25 @@ const MOCK_QUESTIONS = [
   { id: "q3", text: "React hooks must be called…", options: ["Conditionally", "Inside loops", "At the top level", "Inside classes"] },
 ];
 
+const SESSION_SECONDS = 45 * 60;
+
+function formatTime(totalSeconds: number) {
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
 export default function ExamSitPage() {
   const { session } = useSession();
-  const { registerStudent, sendStatus, sendFlag, connected, alert, clearAlert } = useProctorSocket(
+  const { registerStudent, sendStatus, sendFlag, connected, connectionError, alert, clearAlert } = useProctorSocket(
     session?.studentId ?? null
   );
 
   const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [flagged, setFlagged] = useState<Set<string>>(new Set());
   const [current, setCurrent] = useState(0);
   const [banner, setBanner] = useState<{ message: string; timestamp: number } | null>(null);
+  const [secondsLeft, setSecondsLeft] = useState(SESSION_SECONDS);
 
   const { videoRef, start, running, modelReady } = useGazeMonitor({
     // drawOverlay left false — this page never shows the feed to the student
@@ -72,85 +81,354 @@ export default function ExamSitPage() {
     return () => document.removeEventListener("visibilitychange", handleVisibility);
   }, [session, sendFlag]);
 
-  if (!session) {
-    return <div className="min-h-screen flex items-center justify-center text-slate-300 bg-slate-950">Please log in first.</div>;
-  }
+  // Session countdown.
+  useEffect(() => {
+    const id = setInterval(() => setSecondsLeft((s) => Math.max(0, s - 1)), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Copy/paste restriction inside terminal mode.
+  useEffect(() => {
+    function blockClipboard(e: KeyboardEvent) {
+      if ((e.ctrlKey || e.metaKey) && (e.key === "c" || e.key === "v")) {
+        e.preventDefault();
+        if (session) sendFlag(session.studentId, "Attempted copy/paste while in terminal mode.", Date.now());
+      }
+    }
+    document.addEventListener("keydown", blockClipboard);
+    return () => document.removeEventListener("keydown", blockClipboard);
+  }, [session, sendFlag]);
 
   const question = MOCK_QUESTIONS[current];
+  const progressPct = useMemo(() => Math.round(((current + 1) / MOCK_QUESTIONS.length) * 100), [current]);
+  const initials = (session?.name || session?.studentId || "?").slice(0, 2).toUpperCase();
+
+  function toggleFlag() {
+    setFlagged((prev) => {
+      const next = new Set(prev);
+      if (next.has(question.id)) next.delete(question.id);
+      else next.add(question.id);
+      return next;
+    });
+  }
+
+  function goTo(index: number) {
+    setCurrent(Math.min(Math.max(index, 0), MOCK_QUESTIONS.length - 1));
+  }
+
+  function handleEndSession() {
+    if (typeof window !== "undefined" && window.confirm("End this exam session? You won't be able to resume.")) {
+      window.location.href = "/login";
+    }
+  }
+
+  if (!session) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background text-body-sm text-muted-foreground">
+        Please log in first.
+      </div>
+    );
+  }
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100">
+    <div className="min-h-screen bg-background font-body text-foreground">
       {/* Hidden video element — camera runs, nothing rendered to the student. */}
       <video ref={videoRef} autoPlay playsInline muted className="hidden" />
 
-      <header className="border-b border-cyan-500/20 px-6 py-4 flex items-center justify-between">
-        <div>
-          <p className="text-sm font-semibold">Exam in progress</p>
-          <p className="text-xs text-slate-400">
-            {session.name} · ID {session.studentId} · monitoring {running ? "active" : "starting…"}
-          </p>
+      {/* Top app bar */}
+      <header className="fixed top-0 z-50 flex h-16 w-full items-center border-b border-border bg-background">
+        <div className="mx-auto flex w-full max-w-container-max-width items-center justify-between px-margin-mobile md:px-margin-desktop">
+          <div className="flex items-center gap-6">
+            <span className="font-display text-headline-md font-bold text-foreground">Proctoria Student Terminal</span>
+            <nav className="hidden items-center gap-gutter md:flex">
+              <a href="#" className="font-mono text-label-md text-muted-foreground transition-opacity hover:text-primary">
+                Dashboard
+              </a>
+              <a href="#" className="ml-6 border-b-2 border-primary pb-1 font-mono text-label-md font-bold text-primary">
+                Exams
+              </a>
+            </nav>
+          </div>
+
+          <div className="flex items-center gap-gutter">
+            {/* Monitor status indicator */}
+            <div
+              className={`hidden items-center gap-2 rounded-full border px-3 py-1.5 sm:flex ${
+                connectionError ? "border-destructive/30 bg-destructive/10" : "border-accent/20 bg-muted"
+              }`}
+            >
+              <span
+                className={`material-symbols-outlined text-sm ${
+                  connectionError ? "text-destructive" : "animate-pulse text-accent"
+                }`}
+                style={{ fontVariationSettings: "'FILL' 1" }}
+              >
+                {connectionError ? "wifi_off" : "wifi_tethering"}
+              </span>
+              <span
+                className={`font-mono text-label-sm uppercase tracking-widest ${
+                  connectionError ? "text-destructive" : "text-accent"
+                }`}
+              >
+                {connectionError ? "Monitor Offline" : running ? "Monitor Synced" : "Connecting…"}
+              </span>
+            </div>
+
+            <div className="flex items-center gap-4">
+              <button
+                onClick={handleEndSession}
+                className="rounded bg-destructive/20 px-4 py-2 font-mono text-label-md text-destructive transition-all hover:brightness-110 active:scale-95"
+              >
+                End Session
+              </button>
+
+              <div className="flex h-8 w-8 items-center justify-center rounded-full border border-border bg-muted font-mono text-label-sm text-foreground">
+                {initials}
+              </div>
+            </div>
+          </div>
         </div>
-        <a href={`/monitor/${session.studentId}`} target="_blank" rel="noreferrer" className="text-xs text-cyan-400 underline">
-          View my monitoring feed ↗
-        </a>
       </header>
 
       {/* Alert banner — visible to this student only, when the proctor sends one. */}
       {banner && (
-        <div className="mx-6 mt-4 flex items-start justify-between gap-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-200">
-          <div className="flex gap-2">
-            <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
-            <span>{banner.message}</span>
+        <div className="fixed left-1/2 top-20 z-40 w-[calc(100%-2rem)] max-w-xl -translate-x-1/2 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-body-sm text-destructive shadow-2xl backdrop-blur-md">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex gap-2">
+              <span className="material-symbols-outlined mt-0.5 shrink-0 text-[18px]">warning</span>
+              <span>{banner.message}</span>
+            </div>
+            <button onClick={() => setBanner(null)} aria-label="Dismiss alert">
+              <span className="material-symbols-outlined text-[18px]">close</span>
+            </button>
           </div>
-          <button onClick={() => setBanner(null)} aria-label="Dismiss alert">
-            <X className="h-4 w-4" />
-          </button>
         </div>
       )}
 
-      <main className="max-w-2xl mx-auto px-6 py-12">
-        <p className="text-xs uppercase tracking-wide text-cyan-400 mb-2">
-          Question {current + 1} of {MOCK_QUESTIONS.length}
-        </p>
-        <h2 className="text-xl font-semibold mb-6">{question.text}</h2>
-
-        <div className="space-y-3">
-          {question.options.map((opt) => (
-            <label
-              key={opt}
-              className={`block cursor-pointer rounded-lg border px-4 py-3 text-sm ${
-                answers[question.id] === opt ? "border-cyan-400 bg-cyan-500/10" : "border-slate-700"
-              }`}
-            >
-              <input
-                type="radio"
-                name={question.id}
-                className="mr-3"
-                checked={answers[question.id] === opt}
-                onChange={() => setAnswers((prev) => ({ ...prev, [question.id]: opt }))}
-              />
-              {opt}
-            </label>
-          ))}
+      {/* Main content */}
+      <main className="mx-auto flex min-h-screen w-full max-w-container-max-width flex-col px-margin-mobile pb-32 pt-24 md:px-margin-desktop">
+        {/* Exam progress header */}
+        <div className="mb-12 flex flex-col gap-4">
+          <div className="flex flex-col justify-between gap-2 sm:flex-row sm:items-end">
+            <div>
+              <h1 className="font-display text-headline-lg text-foreground">
+                Advanced Systems Architecture — Midterm
+              </h1>
+              <p className="mt-1 font-mono text-label-md uppercase tracking-widest text-muted-foreground">
+                Question {String(current + 1).padStart(2, "0")} of {String(MOCK_QUESTIONS.length).padStart(2, "0")}
+              </p>
+            </div>
+            <div className="text-left sm:text-right">
+              <span className="mb-1 block font-mono text-label-md uppercase text-muted-foreground">
+                Session Time Remaining
+              </span>
+              <span
+                className={`font-display text-headline-lg font-bold tabular-nums ${
+                  secondsLeft < 300 ? "text-destructive" : "text-primary"
+                }`}
+              >
+                {formatTime(secondsLeft)}
+              </span>
+            </div>
+          </div>
+          {/* Progress bar */}
+          <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
+            <div
+              className="h-full bg-primary transition-all duration-500"
+              style={{ width: `${progressPct}%` }}
+            />
+          </div>
         </div>
 
-        <div className="mt-8 flex justify-between">
-          <button
-            disabled={current === 0}
-            onClick={() => setCurrent((c) => c - 1)}
-            className="rounded-md border border-slate-700 px-4 py-2 text-sm disabled:opacity-40"
-          >
-            Previous
-          </button>
-          <button
-            disabled={current === MOCK_QUESTIONS.length - 1}
-            onClick={() => setCurrent((c) => c + 1)}
-            className="rounded-md bg-cyan-500 px-4 py-2 text-sm font-medium text-slate-950 disabled:opacity-40"
-          >
-            Next
-          </button>
+        {/* Question area */}
+        <div className="grid flex-grow grid-cols-12 gap-gutter">
+          {/* Main question container */}
+          <div className="col-span-12 flex flex-col gap-gutter lg:col-span-8">
+            <div className="rounded-lg border border-border bg-card p-6 md:p-10">
+              <h2 className="mb-8 font-display text-headline-md leading-relaxed text-foreground">
+                {question.text}
+              </h2>
+
+              <div className="space-y-3">
+                {question.options.map((opt) => {
+                  const selected = answers[question.id] === opt;
+                  return (
+                    <label
+                      key={opt}
+                      className={`flex cursor-pointer items-center gap-3 rounded border px-4 py-3 text-body-sm transition-all ${
+                        selected
+                          ? "border-primary bg-primary/10 text-foreground"
+                          : "border-border text-muted-foreground hover:bg-muted"
+                      }`}
+                    >
+                      <span
+                        className={`flex h-4 w-4 shrink-0 items-center justify-center rounded-full border-2 transition-colors ${
+                          selected ? "border-primary" : "border-muted-foreground/50"
+                        }`}
+                      >
+                        {selected && <span className="h-2 w-2 rounded-full bg-primary" />}
+                      </span>
+                      <input
+                        type="radio"
+                        name={question.id}
+                        className="sr-only"
+                        checked={selected}
+                        onChange={() => setAnswers((prev) => ({ ...prev, [question.id]: opt }))}
+                      />
+                      <span className={selected ? "text-foreground" : ""}>{opt}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          {/* Sidebar / References */}
+          <aside className="col-span-12 flex flex-col gap-gutter lg:col-span-4">
+            {/* Guidelines */}
+            <div className="rounded-lg border border-border bg-card/50 p-6">
+              <div className="mb-4 flex items-center gap-2">
+                <span className="material-symbols-outlined text-sm text-primary">info</span>
+                <h3 className="font-mono text-label-md uppercase tracking-widest text-primary">
+                  Question Guidelines
+                </h3>
+              </div>
+              <ul className="space-y-3 font-body text-body-sm text-muted-foreground">
+                <li className="flex gap-2">
+                  <span className="text-primary">•</span> Read each option carefully before selecting.
+                </li>
+                <li className="flex gap-2">
+                  <span className="text-primary">•</span> You can flag a question and return to it later.
+                </li>
+                <li className="flex gap-2">
+                  <span className="text-primary">•</span> Answers auto-save as you navigate.
+                </li>
+              </ul>
+            </div>
+
+            {/* Integrity log */}
+            <div className="rounded-lg border border-border bg-card/50 p-6">
+              <div className="mb-4 flex items-center gap-2">
+                <span className="material-symbols-outlined text-sm text-accent">verified_user</span>
+                <h3 className="font-mono text-label-md uppercase tracking-widest text-accent">Integrity Log</h3>
+              </div>
+              <div className="space-y-4">
+                <div className="flex items-center justify-between">
+                  <span className="text-body-sm text-muted-foreground">Network Stability</span>
+                  <span className="rounded bg-accent/15 px-2 py-0.5 font-mono text-label-sm text-accent">
+                    {connected ? "STABLE" : "DOWN"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-body-sm text-muted-foreground">Browser Lockdown</span>
+                  <span className="rounded bg-accent/15 px-2 py-0.5 font-mono text-label-sm text-accent">ACTIVE</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-body-sm text-muted-foreground">Camera Monitor</span>
+                  <span
+                    className={`rounded px-2 py-0.5 font-mono text-label-sm ${
+                      running ? "bg-accent/15 text-accent" : "bg-muted text-muted-foreground"
+                    }`}
+                  >
+                    {running ? "ACTIVE" : "STARTING"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-body-sm text-muted-foreground">Peripheral Check</span>
+                  <span className="rounded bg-muted px-2 py-0.5 font-mono text-label-sm text-muted-foreground">
+                    NONE
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Navigation map — bento-style tiles */}
+            <div className="flex flex-col gap-2">
+              <h3 className="px-1 font-mono text-label-sm uppercase tracking-widest text-muted-foreground">
+                Navigation Map
+              </h3>
+              <div className="grid grid-cols-5 gap-2">
+                {MOCK_QUESTIONS.map((q, i) => {
+                  const isCurrent = i === current;
+                  const isFlagged = flagged.has(q.id);
+                  const isDone = Boolean(answers[q.id]);
+
+                  let cellClasses =
+                    "flex h-10 items-center justify-center rounded font-mono text-label-md transition-all";
+                  if (isCurrent) {
+                    cellClasses += " scale-110 z-10 bg-primary text-primary-foreground border-2 border-primary shadow-[0_0_10px_hsl(var(--primary)/0.3)]";
+                  } else if (isFlagged) {
+                    cellClasses += " bg-destructive/15 text-destructive border border-destructive/30";
+                  } else if (isDone) {
+                    cellClasses += " bg-secondary/15 text-secondary border border-secondary/20";
+                  } else {
+                    cellClasses += " bg-muted text-muted-foreground opacity-50";
+                  }
+
+                  return (
+                    <button key={q.id} type="button" onClick={() => goTo(i)} className={cellClasses}>
+                      {isFlagged ? (
+                        <span
+                          className="material-symbols-outlined text-[14px]"
+                          style={{ fontVariationSettings: "'FILL' 1" }}
+                        >
+                          flag
+                        </span>
+                      ) : (
+                        String(i + 1).padStart(2, "0")
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </aside>
         </div>
       </main>
+
+      {/* Bottom navigation bar */}
+      <footer className="fixed bottom-0 z-50 flex h-20 w-full items-center border-t border-border bg-card/90 backdrop-blur-xl">
+        <div className="mx-auto flex w-full max-w-container-max-width items-center justify-between px-margin-mobile md:px-margin-desktop">
+          <button
+            disabled={current === 0}
+            onClick={() => goTo(current - 1)}
+            className="group flex items-center gap-2 px-2 py-2 text-muted-foreground transition-all hover:text-primary disabled:opacity-30 md:px-6"
+          >
+            <span className="material-symbols-outlined transition-transform group-active:-translate-x-1">
+              arrow_back
+            </span>
+            <span className="hidden font-mono text-label-md sm:inline">Previous Question</span>
+          </button>
+
+          <div className="flex items-center gap-gutter">
+            <button
+              type="button"
+              onClick={toggleFlag}
+              className={`flex items-center gap-2 rounded-full border px-4 py-2.5 transition-all active:scale-95 md:px-6 ${
+                flagged.has(question.id)
+                  ? "border-destructive/50 bg-destructive/15 text-destructive"
+                  : "border-border text-foreground hover:bg-muted"
+              }`}
+            >
+              <span
+                className="material-symbols-outlined text-[18px]"
+                style={{ fontVariationSettings: flagged.has(question.id) ? "'FILL' 1" : "'FILL' 0" }}
+              >
+                flag
+              </span>
+              <span className="hidden font-mono text-label-md sm:inline">Flag for Review</span>
+            </button>
+
+            <button
+              onClick={() => (current === MOCK_QUESTIONS.length - 1 ? undefined : goTo(current + 1))}
+              className="flex items-center gap-2 rounded-full bg-primary px-6 py-3 font-mono text-label-md font-bold text-primary-foreground transition-all hover:brightness-105 hover:shadow-[0_4px_20px_hsl(var(--primary)/0.25)] active:scale-95 md:px-10"
+            >
+              <span>{current === MOCK_QUESTIONS.length - 1 ? "Submit Exam" : "Save & Next"}</span>
+              <span className="material-symbols-outlined">arrow_forward</span>
+            </button>
+          </div>
+        </div>
+      </footer>
     </div>
   );
 }
