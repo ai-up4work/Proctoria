@@ -8,10 +8,13 @@ import {
   CalendarDays,
   CheckCircle2,
   ChevronRight,
+  Eye,
   Flag,
   History,
+  Info,
   Loader2,
   MessageCircle,
+  Mic,
   Plus,
   Radio,
   Send,
@@ -24,11 +27,11 @@ import { useSession } from "@/context/SessionContext";
 import { useProctorSocket } from "@/hooks/useProctorSocket";
 
 const NAV_ITEMS = [
-  { label: "Live Proctoring", icon: Radio, active: true },
-  { label: "Student Directory", icon: Users },
-  { label: "Exam Schedule", icon: CalendarDays },
-  { label: "Violation Flags", icon: Flag },
-  { label: "System Status", icon: Settings2 },
+  { label: "Live Proctoring", icon: Radio, active: true, link: "/proctor/dashboard" },
+  { label: "Student Directory", icon: Users, active: false, link: "/proctor/students" },
+  { label: "Exam Schedule", icon: CalendarDays, active: false, link: "/proctor/schedule" },
+  { label: "Violation Flags", icon: Flag, active: false, link: "/proctor/flags" },
+  { label: "System Status", icon: Settings2, active: false, link: "/proctor/system" },
 ];
 
 const QUICK_ALERT_MESSAGE = "Please keep your eyes on the screen and remain in frame.";
@@ -79,6 +82,60 @@ const SEVERITY_STYLES: Record<
   },
 };
 
+// Event Feed color-coding — classifies a raw flag/status message into a
+// severity bucket so the feed reads at a glance, same idea as the HTML
+// mockup's red/yellow/neutral feed items.
+type EventSeverity = "critical" | "warning" | "info";
+
+function classifyEvent(message: string): EventSeverity {
+  const m = message.toLowerCase();
+  const criticalKeywords = [
+    "multiple face",
+    "face not detected",
+    "no face",
+    "gaze away",
+    "away from screen",
+    "prohibited",
+    "object detected",
+    "device detected",
+    "unauthorized",
+  ];
+  const warningKeywords = ["tab", "focus", "copy/paste", "copy or paste", "audio", "mic", "clipboard"];
+
+  if (criticalKeywords.some((kw) => m.includes(kw))) return "critical";
+  if (warningKeywords.some((kw) => m.includes(kw))) return "warning";
+  return "info";
+}
+
+const EVENT_STYLES: Record<
+  EventSeverity,
+  {
+    border: string;
+    bg: string;
+    text: string;
+    icon: typeof Eye;
+  }
+> = {
+  critical: {
+    border: "border-destructive",
+    bg: "bg-destructive/10 hover:bg-destructive/20",
+    text: "text-destructive",
+    icon: Eye,
+  },
+  warning: {
+    border: "border-secondary",
+    bg: "bg-secondary/10 hover:bg-secondary/20",
+    text: "text-secondary",
+    icon: Mic,
+  },
+  info: {
+    border: "border-border",
+    bg: "bg-card/60 hover:bg-card",
+    text: "text-muted-foreground",
+    icon: Info,
+  },
+};
+
 export default function ProctorDashboardPage() {
   const { session } = useSession();
   // Proctors need a stable clientId too, since Ably tokens are per-clientId.
@@ -87,6 +144,7 @@ export default function ProctorDashboardPage() {
   );
   const [alertDrafts, setAlertDrafts] = useState<Record<string, string>>({});
   const [justSent, setJustSent] = useState<Record<string, boolean>>({});
+  const [feedFilter, setFeedFilter] = useState<"all" | "flags">("all");
   const inputRefs = useRef<Record<string, HTMLInputElement | null>>({});
 
   useEffect(() => {
@@ -141,6 +199,11 @@ export default function ProctorDashboardPage() {
 
   const flaggedCount = roster.reduce((sum, s) => sum + (s.lastStatus?.flagCount ?? 0), 0);
 
+  const visibleEvents = events.filter(function passesFilter(e) {
+    if (feedFilter === "all") return true;
+    return classifyEvent(e.message) !== "info";
+  });
+
   return (
     <div className="min-h-screen bg-background text-foreground font-body">
       {/* Sidebar Navigation */}
@@ -158,20 +221,23 @@ export default function ProctorDashboardPage() {
         </div>
 
         <nav className="mt-8 flex-1 px-3 space-y-1">
-          {NAV_ITEMS.map(({ label, icon: Icon, active }) => (
-            <a
-              key={label}
-              href="#"
-              className={
-                active
-                  ? "flex items-center gap-4 px-4 py-3 rounded-lg text-sidebar-primary font-bold border-r-4 border-sidebar-primary bg-sidebar-accent/10 transition-colors"
-                  : "flex items-center gap-4 px-4 py-3 rounded-lg text-sidebar-foreground/70 hover:bg-sidebar-accent/10 hover:text-sidebar-foreground transition-colors active:scale-[0.98]"
-              }
-            >
-              <Icon className="h-4 w-4" />
-              <span className="text-sm">{label}</span>
-            </a>
-          ))}
+          {NAV_ITEMS.map(function renderNavItem(item) {
+            const NavIcon = item.icon;
+            return (
+              <a
+                key={item.label}
+                href={item.link}
+                className={
+                  item.active
+                    ? "flex items-center gap-4 px-4 py-3 rounded-lg text-sidebar-primary font-bold border-r-4 border-sidebar-primary bg-sidebar-accent/10 transition-colors"
+                    : "flex items-center gap-4 px-4 py-3 rounded-lg text-sidebar-foreground/70 hover:bg-sidebar-accent/10 hover:text-sidebar-foreground transition-colors active:scale-[0.98]"
+                }
+              >
+                <NavIcon className="h-4 w-4" />
+                <span className="text-sm">{item.label}</span>
+              </a>
+            );
+          })}
         </nav>
 
         <div className="px-3 py-6 space-y-1 border-t border-sidebar-border">
@@ -192,8 +258,7 @@ export default function ProctorDashboardPage() {
       </aside>
 
       {/* Main Content */}
-      <main className="ml-64 mr-80 min-h-screen flex flex-col relative">
-        {/* Header */}
+      <main className="mr-80 min-h-screen flex flex-col relative">
         <header className="h-20 bg-background/80 backdrop-blur-md border-b border-border flex items-center justify-between px-10 sticky top-0 z-30">
           <div className="flex flex-col">
             <h1 className="font-display text-[length:var(--text-headline-md)] font-bold text-foreground">
@@ -248,12 +313,13 @@ export default function ProctorDashboardPage() {
         {/* Bento Grid of Student Cards */}
         <section className="p-10 overflow-y-auto scrollbar-thin flex-1">
           <div className="grid grid-cols-1 xl:grid-cols-2 2xl:grid-cols-3 gap-6">
-            {roster.map((s) => {
+            {roster.map(function renderStudentCard(s) {
               const state = s.lastStatus?.result?.state;
               const severity = severityOf(state);
               const styles = SEVERITY_STYLES[severity];
-              const Icon = styles.icon;
+              const CardIcon = styles.icon;
               const flagCount = s.lastStatus?.flagCount ?? 0;
+              const monitorHref = "/monitor/" + s.studentId;
 
               return (
                 <div
@@ -295,9 +361,9 @@ export default function ProctorDashboardPage() {
                     </div>
 
                     <div className="flex items-center gap-2 mb-3">
-                      <Icon className={`h-4 w-4 ${styles.dot}`} />
+                      <CardIcon className={`h-4 w-4 ${styles.dot}`} />
                       <a
-                        href={`/monitor/${s.studentId}`}
+                        href={monitorHref}
                         target="_blank"
                         rel="noreferrer"
                         className="text-xs text-accent underline flex items-center gap-0.5"
@@ -377,31 +443,57 @@ export default function ProctorDashboardPage() {
             </span>
           </div>
           <div className="mt-4 flex gap-2">
-            <button className="flex-1 text-[10px] font-bold uppercase py-1 px-2 rounded bg-muted text-foreground border border-border">
+            <button
+              type="button"
+              onClick={() => setFeedFilter("all")}
+              className={`flex-1 text-[10px] font-bold uppercase py-1 px-2 rounded border transition-colors ${
+                feedFilter === "all"
+                  ? "bg-muted text-foreground border-border"
+                  : "border-transparent text-muted-foreground hover:bg-muted/50"
+              }`}
+            >
               All Events
             </button>
-            <button className="flex-1 text-[10px] font-bold uppercase py-1 px-2 rounded border border-destructive/50 text-destructive">
+            <button
+              type="button"
+              onClick={() => setFeedFilter("flags")}
+              className={`flex-1 text-[10px] font-bold uppercase py-1 px-2 rounded border transition-colors ${
+                feedFilter === "flags"
+                  ? "bg-destructive/15 text-destructive border-destructive/50"
+                  : "border-transparent text-muted-foreground hover:bg-muted/50"
+              }`}
+            >
               Only Flags
             </button>
           </div>
         </div>
 
         <div className="flex-1 overflow-y-auto scrollbar-thin p-4 space-y-3">
-          {events.map((e, i) => (
-            <div
-              key={i}
-              className="p-3 bg-card/60 border-l-4 border-border rounded-r-lg cursor-pointer hover:bg-card transition-colors"
-            >
-              <div className="flex justify-between items-start">
-                <span className="text-[10px] font-mono text-muted-foreground uppercase">
-                  {new Date(e.timestamp).toLocaleTimeString([], { hour12: false })}
-                </span>
+          {visibleEvents.map(function renderEvent(e, i) {
+            const severity = classifyEvent(e.message);
+            const styles = EVENT_STYLES[severity];
+            const EventIcon = styles.icon;
+            return (
+              <div
+                key={i}
+                className={`p-3 ${styles.bg} border-l-4 ${styles.border} rounded-r-lg cursor-pointer transition-colors`}
+              >
+                <div className="flex justify-between items-start">
+                  <span
+                    className={`text-[10px] font-mono uppercase ${
+                      severity === "info" ? "text-muted-foreground" : styles.text
+                    }`}
+                  >
+                    {new Date(e.timestamp).toLocaleTimeString([], { hour12: false })}
+                  </span>
+                  <EventIcon className={`h-3.5 w-3.5 ${styles.text}`} />
+                </div>
+                <p className="mt-1 text-sm font-bold text-foreground">{e.studentId}</p>
+                <p className="text-xs text-muted-foreground leading-tight">{e.message}</p>
               </div>
-              <p className="mt-1 text-sm font-bold text-foreground">{e.studentId}</p>
-              <p className="text-xs text-muted-foreground leading-tight">{e.message}</p>
-            </div>
-          ))}
-          {events.length === 0 && (
+            );
+          })}
+          {visibleEvents.length === 0 && (
             <div className="flex flex-col items-center justify-center gap-2 py-10 text-muted-foreground text-xs">
               <Loader2 className="h-4 w-4 animate-spin" />
               No events yet.

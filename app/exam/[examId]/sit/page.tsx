@@ -102,6 +102,7 @@ export default function ExamSitPage() {
   const question = MOCK_QUESTIONS[current];
   const progressPct = useMemo(() => Math.round(((current + 1) / MOCK_QUESTIONS.length) * 100), [current]);
   const initials = (session?.name || session?.studentId || "?").slice(0, 2).toUpperCase();
+  const myFeedHref = session ? "/monitor/" + session.studentId : "/monitor";
 
   function toggleFlag() {
     setFlagged((prev) => {
@@ -141,11 +142,14 @@ export default function ExamSitPage() {
           <div className="flex items-center gap-6">
             <span className="font-display text-headline-md font-bold text-foreground">Proctoria Student Terminal</span>
             <nav className="hidden items-center gap-gutter md:flex">
-              <a href="#" className="font-mono text-label-md text-muted-foreground transition-opacity hover:text-primary">
+              <a href="/dashboard" className="font-mono text-label-md text-muted-foreground transition-opacity hover:text-primary">
                 Dashboard
               </a>
-              <a href="#" className="ml-6 border-b-2 border-primary pb-1 font-mono text-label-md font-bold text-primary">
+              <a href="/exams" className="ml-6 font-mono text-label-md text-muted-foreground transition-opacity hover:text-primary">
                 Exams
+              </a>
+              <a href={myFeedHref} className="ml-6 border-b-2 border-primary pb-1 font-mono text-label-md font-bold text-primary">
+                My Feed
               </a>
             </nav>
           </div>

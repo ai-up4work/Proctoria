@@ -93,7 +93,8 @@ export default function StudentMonitorPage() {
     result.state === "ok" ? "text-accent" : result.state === "warn" ? "text-primary" : "text-destructive";
 
   const initials = (session?.name || studentId || "?").slice(0, 2).toUpperCase();
-  const sessionCode = `PRX-${studentId.replace(/[^A-Za-z0-9]/g, "").slice(-4).toUpperCase() || "0000"}`;
+  const sessionCode = "PRX-" + (studentId.replace(/[^A-Za-z0-9]/g, "").slice(-4).toUpperCase() || "0000");
+  const myFeedHref = "/monitor/" + studentId;
 
   function downloadIncidentReport() {
     const report = {
@@ -109,7 +110,7 @@ export default function StudentMonitorPage() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `proctoria-incident-report-${studentId}.json`;
+    a.download = "proctoria-incident-report-" + studentId + ".json";
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -125,10 +126,10 @@ export default function StudentMonitorPage() {
           <h1 className="font-display text-headline-md font-bold text-foreground">Proctoria Student Terminal</h1>
         </div>
         <nav className="hidden items-center gap-gutter md:flex">
-          <a href="#" className="font-mono text-label-md text-muted-foreground transition-opacity hover:text-primary">
+          <a href="/dashboard" className="font-mono text-label-md text-muted-foreground transition-opacity hover:text-primary">
             Dashboard
           </a>
-          <a href="#" className="border-b-2 border-primary pb-1 font-mono text-label-md font-bold text-primary">
+          <a href={myFeedHref} className="ml-6 border-b-2 border-primary pb-1 font-mono text-label-md font-bold text-primary">
             My Feed
           </a>
         </nav>
@@ -150,8 +151,7 @@ export default function StudentMonitorPage() {
       {/* Main content */}
       <main className="mx-auto flex min-h-0 w-full max-w-container-max-width flex-1 flex-col md:flex-row">
         {/* Left: mirrored camera feed */}
-        <section className="flex w-full flex-col gap-gutter border-b border-border bg-surface-container-lowest p-margin-mobile md:w-7/12 md:border-b-0 md:border-r md:p-margin-desktop"
-        >
+        <section className="flex w-full flex-col gap-gutter border-b border-border bg-surface-container-lowest p-margin-mobile md:w-7/12 md:border-b-0 md:border-r md:p-margin-desktop">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-base">
               <span className={`h-3 w-3 rounded-full ${running ? "animate-pulse bg-accent" : "bg-muted-foreground"}`} />
