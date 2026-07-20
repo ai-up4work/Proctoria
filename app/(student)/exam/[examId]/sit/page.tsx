@@ -10,6 +10,11 @@ import { MOCK_QUESTIONS } from "@/lib/mockQuestions";
 
 const SESSION_SECONDS = 45 * 60;
 
+// How often to re-flag a student who is still away from the tab. Chosen to
+// be well above the browser's ~1s background-timer clamp so it fires
+// reliably even while backgrounded.
+const AWAY_REFLAG_MS = 10000;
+
 function formatTime(totalSeconds: number) {
   const m = Math.floor(totalSeconds / 60);
   const s = totalSeconds % 60;
@@ -65,16 +70,86 @@ export default function ExamSitPage() {
     }
   }, [alert, clearAlert]);
 
-  // Tab-switch / window-blur detection — flagged the same way as gaze events.
+  // Tab-switch / window-blur detection.
+  //
+  // NOTE: this is intentionally the *only* signal we trust while the tab is
+  // hidden. The gaze loop (useGazeMonitor) is driven by requestAnimationFrame,
+  // which browsers throttle heavily in background tabs — and even if it kept
+  // running, most browsers pause video frame decoding for a backgrounded
+  // tab, so MediaPipe would just keep re-analyzing the last frame it saw
+  // before the switch. That means gaze/face state can silently go stale and
+  // keep reporting "Verified" the whole time the student is away. So instead
+  // of trying to keep gaze detection alive in the background, we treat
+  // document.hidden as authoritative: push an immediate "away" status the
+  // moment the tab is hidden (so the proctor dashboard doesn't keep showing
+  // stale green), and keep re-flagging on an interval for as long as the
+  // student stays away, so a 5-minute absence produces more than one log
+  // line. On return, we log how long they were gone and let the gaze loop
+  // resume producing real status updates on its own.
   useEffect(() => {
+    if (!session) return;
+
+    let awayTimer: ReturnType<typeof setInterval> | null = null;
+    let hiddenSince: number | null = null;
+
     function handleVisibility() {
-      if (document.hidden && session) {
+      if (!session) return;
+
+      if (document.hidden) {
+        hiddenSince = Date.now();
+
         sendFlag(session.studentId, "Student switched tabs or minimized the window.", Date.now(), "tab_switch");
+
+        // Immediately mark the student as "away" for the dashboard, rather
+        // than leaving whatever gaze-loop status was last computed (which
+        // will not update again until the tab is visible).
+        sendStatus(session.studentId, {
+          result: {
+            state: "bad",
+            title: "Tab Away",
+            sub: "Student navigated away from the exam tab",
+            faceDetected: false,
+            gazeLabel: "unknown",
+            confidence: 0,
+          },
+        });
+
+        awayTimer = setInterval(() => {
+          if (hiddenSince === null) return;
+          const awaySeconds = Math.round((Date.now() - hiddenSince) / 1000);
+          sendFlag(
+            session.studentId,
+            `Still away from the exam tab (${awaySeconds}s and counting).`,
+            Date.now(),
+            "tab_switch"
+          );
+        }, AWAY_REFLAG_MS);
+      } else {
+        if (awayTimer) {
+          clearInterval(awayTimer);
+          awayTimer = null;
+        }
+        if (hiddenSince !== null) {
+          const awaySeconds = Math.round((Date.now() - hiddenSince) / 1000);
+          sendFlag(
+            session.studentId,
+            `Returned to the exam tab after ${awaySeconds}s away.`,
+            Date.now(),
+            "tab_switch"
+          );
+          hiddenSince = null;
+        }
+        // The gaze loop's own onStatus callback will resume publishing
+        // fresh status on its next processed frame — nothing to do here.
       }
     }
+
     document.addEventListener("visibilitychange", handleVisibility);
-    return () => document.removeEventListener("visibilitychange", handleVisibility);
-  }, [session, sendFlag]);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibility);
+      if (awayTimer) clearInterval(awayTimer);
+    };
+  }, [session, sendFlag, sendStatus]);
 
   // Session countdown — paused while monitoring is blocked (camera error),
   // so a student can't run the clock out by denying camera access.

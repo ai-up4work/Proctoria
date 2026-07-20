@@ -1,12 +1,13 @@
 // app/proctor/dashboard/page.tsx
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Bell,
   CalendarDays,
   CheckCircle2,
+  ChevronDown,
   ChevronRight,
   Clipboard,
   Eye,
@@ -25,6 +26,7 @@ import {
   SwitchCamera,
   Users,
   Wifi,
+  X,
 } from "lucide-react";
 import { useSession } from "@/context/SessionContext";
 import { useProctorSocket } from "@/hooks/useProctorSocket";
@@ -39,6 +41,24 @@ const NAV_ITEMS = [
 ];
 
 const QUICK_ALERT_MESSAGE = "Please keep your eyes on the screen and remain in frame.";
+
+// All known flag categories, in the order we want them to appear as filter chips.
+const ALL_CATEGORIES: FlagCategory[] = [
+  "no_face",
+  "multiple_faces",
+  "gaze_away",
+  "head_away",
+  "tab_switch",
+  "clipboard",
+  "system",
+];
+
+const SEVERITY_FILTERS: { value: "all" | FlagSeverity; label: string }[] = [
+  { value: "all", label: "All Events" },
+  { value: "critical", label: "Critical" },
+  { value: "warning", label: "Warning" },
+  { value: "info", label: "Info" },
+];
 
 type Severity = "critical" | "warning" | "stable";
 
@@ -132,7 +152,13 @@ export default function ProctorDashboardPage() {
   );
   const [alertDrafts, setAlertDrafts] = useState<Record<string, string>>({});
   const [justSent, setJustSent] = useState<Record<string, boolean>>({});
-  const [feedFilter, setFeedFilter] = useState<"all" | "flags">("all");
+
+  // Event feed filters
+  const [studentFilter, setStudentFilter] = useState<string>("all");
+  const [severityFilter, setSeverityFilter] = useState<"all" | FlagSeverity>("all");
+  const [categoryFilters, setCategoryFilters] = useState<Set<FlagCategory>>(new Set());
+  const [categoryPanelOpen, setCategoryPanelOpen] = useState(false);
+
   const inputRefs = useRef<Record<string, HTMLInputElement | null>>({});
 
   useEffect(() => {
@@ -163,6 +189,21 @@ export default function ProctorDashboardPage() {
     inputRefs.current[studentId]?.focus();
   }
 
+  function toggleCategory(category: FlagCategory) {
+    setCategoryFilters((prev) => {
+      const next = new Set(prev);
+      if (next.has(category)) next.delete(category);
+      else next.add(category);
+      return next;
+    });
+  }
+
+  function clearFilters() {
+    setStudentFilter("all");
+    setSeverityFilter("all");
+    setCategoryFilters(new Set());
+  }
+
   if (!session) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background text-foreground text-sm">
@@ -188,9 +229,15 @@ export default function ProctorDashboardPage() {
   const flaggedCount = roster.reduce((sum, s) => sum + (s.lastStatus?.flagCount ?? 0), 0);
 
   const visibleEvents = events.filter(function passesFilter(e) {
-    if (feedFilter === "all") return true;
-    return FLAG_CATEGORY_META[e.category].severity !== "info";
+    if (studentFilter !== "all" && e.studentId !== studentFilter) return false;
+    const meta = FLAG_CATEGORY_META[e.category];
+    if (severityFilter !== "all" && meta.severity !== severityFilter) return false;
+    if (categoryFilters.size > 0 && !categoryFilters.has(e.category)) return false;
+    return true;
   });
+
+  const activeFilterCount =
+    (studentFilter !== "all" ? 1 : 0) + (severityFilter !== "all" ? 1 : 0) + categoryFilters.size;
 
   return (
     <div className="min-h-screen bg-background text-foreground font-body">
@@ -245,59 +292,62 @@ export default function ProctorDashboardPage() {
         </div>
       </aside>
 
+      {/* Header — spans the full width right of the nav sidebar, including
+          the area above the Event Feed panel, so it reads as one bar across
+          both the main content and the feed. */}
+      <header className="h-20 fixed top-0 left-64 right-0 bg-background/80 backdrop-blur-md border-b border-border flex items-center justify-between px-10 z-50">
+        <div className="flex flex-col">
+          <h1 className="font-display text-[length:var(--text-headline-md)] font-bold text-foreground">
+            Active Session Monitoring
+          </h1>
+          <div className="flex items-center gap-3 mt-1">
+            <span className="flex items-center gap-2 text-accent text-xs font-bold uppercase tracking-widest">
+              <span className="relative flex h-2 w-2">
+                <span
+                  className={`absolute inline-flex h-full w-full rounded-full bg-accent ${
+                    connected ? "animate-ping opacity-75" : "opacity-0"
+                  }`}
+                />
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-accent" />
+              </span>
+              {connected ? "Live Monitoring" : "Connecting…"}
+            </span>
+            <span className="text-muted-foreground text-xs">•</span>
+            <span className="text-muted-foreground text-xs">
+              {roster.length} student{roster.length === 1 ? "" : "s"} in session
+            </span>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-8">
+          <div className="flex gap-6">
+            <div className="flex flex-col items-end">
+              <span className="text-[10px] tracking-widest text-muted-foreground uppercase font-mono">
+                Total Students
+              </span>
+              <span className="font-display text-2xl font-semibold text-foreground">{roster.length}</span>
+            </div>
+            <div className="flex flex-col items-end">
+              <span className="text-[10px] tracking-widest text-muted-foreground uppercase font-mono">
+                Active Flags
+              </span>
+              <span className="font-display text-2xl font-semibold text-destructive">{flaggedCount}</span>
+            </div>
+          </div>
+          <div className="h-10 w-px bg-border" />
+          <div className="flex gap-3">
+            <button className="p-2 text-muted-foreground hover:text-primary transition-colors">
+              <Wifi className="h-5 w-5" />
+            </button>
+            <button className="bg-destructive/20 text-destructive px-6 py-2 rounded-lg font-bold text-sm hover:brightness-110 transition-all active:scale-95">
+              End Session
+            </button>
+          </div>
+        </div>
+      </header>
+
       {/* Main Content */}
-      <main className="mr-80 min-h-screen flex flex-col relative">
-        <header className="h-20 bg-background/80 backdrop-blur-md border-b border-border flex items-center justify-between px-10 sticky top-0 z-30">
-          <div className="flex flex-col">
-            <h1 className="font-display text-[length:var(--text-headline-md)] font-bold text-foreground">
-              Active Session Monitoring
-            </h1>
-            <div className="flex items-center gap-3 mt-1">
-              <span className="flex items-center gap-2 text-accent text-xs font-bold uppercase tracking-widest">
-                <span className="relative flex h-2 w-2">
-                  <span
-                    className={`absolute inline-flex h-full w-full rounded-full bg-accent ${
-                      connected ? "animate-ping opacity-75" : "opacity-0"
-                    }`}
-                  />
-                  <span className="relative inline-flex rounded-full h-2 w-2 bg-accent" />
-                </span>
-                {connected ? "Live Monitoring" : "Connecting…"}
-              </span>
-              <span className="text-muted-foreground text-xs">•</span>
-              <span className="text-muted-foreground text-xs">
-                {roster.length} student{roster.length === 1 ? "" : "s"} in session
-              </span>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-8">
-            <div className="flex gap-6">
-              <div className="flex flex-col items-end">
-                <span className="text-[10px] tracking-widest text-muted-foreground uppercase font-mono">
-                  Total Students
-                </span>
-                <span className="font-display text-2xl font-semibold text-foreground">{roster.length}</span>
-              </div>
-              <div className="flex flex-col items-end">
-                <span className="text-[10px] tracking-widest text-muted-foreground uppercase font-mono">
-                  Active Flags
-                </span>
-                <span className="font-display text-2xl font-semibold text-destructive">{flaggedCount}</span>
-              </div>
-            </div>
-            <div className="h-10 w-px bg-border" />
-            <div className="flex gap-3">
-              <button className="p-2 text-muted-foreground hover:text-primary transition-colors">
-                <Wifi className="h-5 w-5" />
-              </button>
-              <button className="bg-destructive/20 text-destructive px-6 py-2 rounded-lg font-bold text-sm hover:brightness-110 transition-all active:scale-95">
-                End Session
-              </button>
-            </div>
-          </div>
-        </header>
-
+      <main className="mr-80 min-h-screen flex flex-col relative pt-20">
         {/* Bento Grid of Student Cards */}
         <section className="p-10 overflow-y-auto scrollbar-thin flex-1">
           <div className="grid grid-cols-1 xl:grid-cols-2 2xl:grid-cols-3 gap-6">
@@ -358,6 +408,13 @@ export default function ProctorDashboardPage() {
                       >
                         Open live feed <ChevronRight className="h-3 w-3" />
                       </a>
+                      <button
+                        type="button"
+                        onClick={() => setStudentFilter(s.studentId)}
+                        className="ml-auto text-[10px] font-mono text-muted-foreground underline decoration-dotted hover:text-accent"
+                      >
+                        Filter feed
+                      </button>
                     </div>
 
                     <form
@@ -419,9 +476,10 @@ export default function ProctorDashboardPage() {
         </button>
       </main>
 
-      {/* Right Sidebar: Live Event Feed */}
-      <aside className="w-80 h-screen fixed right-0 top-0 bg-sidebar border-l border-sidebar-border flex flex-col z-40">
-        <div className="p-6 border-b border-sidebar-border bg-sidebar/50 backdrop-blur-md">
+      {/* Right Sidebar: Live Event Feed — sits below the header now, rather
+          than running the full viewport height. */}
+      <aside className="w-80 fixed right-0 top-20 h-[calc(100vh-5rem)] bg-sidebar border-l border-sidebar-border flex flex-col z-40">
+        <div className="p-6 border-b border-sidebar-border bg-sidebar/50 backdrop-blur-md space-y-4">
           <div className="flex items-center justify-between">
             <h2 className="font-display text-[length:var(--text-headline-md)] font-bold text-foreground">
               Event Feed
@@ -430,30 +488,110 @@ export default function ProctorDashboardPage() {
               LIVE
             </span>
           </div>
-          <div className="mt-4 flex gap-2">
-            <button
-              type="button"
-              onClick={() => setFeedFilter("all")}
-              className={`flex-1 text-[10px] font-bold uppercase py-1 px-2 rounded border transition-colors ${
-                feedFilter === "all"
-                  ? "bg-muted text-foreground border-border"
-                  : "border-transparent text-muted-foreground hover:bg-muted/50"
-              }`}
+
+          {/* Student filter */}
+          <div>
+            <label className="mb-1 block text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+              Student
+            </label>
+            <select
+              value={studentFilter}
+              onChange={(e) => setStudentFilter(e.target.value)}
+              className="w-full rounded-md border border-input bg-background px-2 py-1.5 text-xs text-foreground outline-none focus:border-accent"
             >
-              All Events
-            </button>
-            <button
-              type="button"
-              onClick={() => setFeedFilter("flags")}
-              className={`flex-1 text-[10px] font-bold uppercase py-1 px-2 rounded border transition-colors ${
-                feedFilter === "flags"
-                  ? "bg-destructive/15 text-destructive border-destructive/50"
-                  : "border-transparent text-muted-foreground hover:bg-muted/50"
-              }`}
-            >
-              Only Flags
-            </button>
+              <option value="all">All Students</option>
+              {roster.map((s) => (
+                <option key={s.studentId} value={s.studentId}>
+                  {s.name || s.studentId}
+                </option>
+              ))}
+            </select>
           </div>
+
+          {/* Severity filter */}
+          <div>
+            <label className="mb-1 block text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+              Severity
+            </label>
+            <div className="flex flex-wrap gap-1.5">
+              {SEVERITY_FILTERS.map((sf) => (
+                <button
+                  key={sf.value}
+                  type="button"
+                  onClick={() => setSeverityFilter(sf.value)}
+                  className={`text-[10px] font-bold uppercase py-1 px-2 rounded border transition-colors ${
+                    severityFilter === sf.value
+                      ? sf.value === "critical"
+                        ? "bg-destructive/15 text-destructive border-destructive/50"
+                        : sf.value === "warning"
+                        ? "bg-secondary/15 text-secondary border-secondary/50"
+                        : "bg-muted text-foreground border-border"
+                      : "border-transparent text-muted-foreground hover:bg-muted/50"
+                  }`}
+                >
+                  {sf.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Category filter — multi-select chips, collapsible */}
+          <div>
+            <button
+              type="button"
+              onClick={() => setCategoryPanelOpen((prev) => !prev)}
+              className="mb-1 flex w-full items-center justify-between text-[10px] font-bold uppercase tracking-widest text-muted-foreground hover:text-foreground transition-colors"
+            >
+              <span className="flex items-center gap-1.5">
+                Category
+                {categoryFilters.size > 0 && (
+                  <span className="rounded-full bg-accent/15 text-accent px-1.5 py-0.5 text-[9px] font-mono normal-case tracking-normal">
+                    {categoryFilters.size}
+                  </span>
+                )}
+              </span>
+              {categoryPanelOpen ? (
+                <ChevronDown className="h-3 w-3" />
+              ) : (
+                <ChevronRight className="h-3 w-3" />
+              )}
+            </button>
+            {categoryPanelOpen && (
+              <div className="flex flex-wrap gap-1.5 pt-1">
+                {ALL_CATEGORIES.map((cat) => {
+                  const meta = FLAG_CATEGORY_META[cat];
+                  const CatIcon = CATEGORY_ICONS[cat];
+                  const active = categoryFilters.has(cat);
+                  return (
+                    <button
+                      key={cat}
+                      type="button"
+                      onClick={() => toggleCategory(cat)}
+                      className={`flex items-center gap-1 text-[10px] font-bold uppercase py-1 px-2 rounded border transition-colors ${
+                        active
+                          ? "bg-accent/15 text-accent border-accent/50"
+                          : "border-border text-muted-foreground hover:bg-muted/50"
+                      }`}
+                    >
+                      <CatIcon className="h-3 w-3" />
+                      {meta.label}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {activeFilterCount > 0 && (
+            <button
+              type="button"
+              onClick={clearFilters}
+              className="flex items-center gap-1 text-[10px] font-mono text-muted-foreground hover:text-destructive"
+            >
+              <X className="h-3 w-3" />
+              Clear {activeFilterCount} filter{activeFilterCount === 1 ? "" : "s"}
+            </button>
+          )}
         </div>
 
         <div className="flex-1 overflow-y-auto scrollbar-thin p-4 space-y-3">
@@ -484,19 +622,21 @@ export default function ProctorDashboardPage() {
               </div>
             );
           })}
-          {visibleEvents.length === 0 && (
+          {visibleEvents.length === 0 && events.length > 0 && (
+            <div className="flex flex-col items-center justify-center gap-2 py-10 text-muted-foreground text-xs text-center px-4">
+              <Info className="h-4 w-4" />
+              No events match the current filters.
+              <button type="button" onClick={clearFilters} className="text-accent underline">
+                Clear filters
+              </button>
+            </div>
+          )}
+          {events.length === 0 && (
             <div className="flex flex-col items-center justify-center gap-2 py-10 text-muted-foreground text-xs">
               <Loader2 className="h-4 w-4 animate-spin" />
               No events yet.
             </div>
           )}
-        </div>
-
-        <div className="p-6 border-t border-sidebar-border">
-          <button className="w-full py-3 bg-muted text-foreground font-bold text-sm rounded-lg border border-border hover:bg-muted/70 transition-all flex items-center justify-center gap-2">
-            <History className="h-4 w-4" />
-            <span>Session Archive</span>
-          </button>
         </div>
       </aside>
     </div>
