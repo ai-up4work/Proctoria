@@ -7,7 +7,7 @@
 export const YAW_LIMIT = 18;
 export const PITCH_LIMIT = 14;
 export const EYE_OFFSET_LIMIT = 0.28;
-export const AWAY_TO_FLAG_MS = 3500;
+export const AWAY_TO_FLAG_MS = 2500;
 export const WINDOW_MS = 10000;
 
 export const LEFT_EYE_CORNERS = [33, 133];
