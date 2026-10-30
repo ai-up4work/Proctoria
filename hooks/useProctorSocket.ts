@@ -3,14 +3,16 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Ably from "ably";
-import { FlagCategory } from "@/lib/gaze";
+import { FLAG_CATEGORY_META, FlagCategory, isFlagCategory } from "@/lib/gaze";
 
 // Single shared channel for status/flag traffic between all students and
-// any proctor. Alerts go over per-student channels instead (see below) so
-// Ably's own channel subscription model enforces "only this student sees
-// this alert" — no server-side routing logic needed.
+// any proctor. Alerts and control nudges go over per-student channels
+// instead, so Ably's own capability model enforces "only this student
+// receives this" — no server-side routing logic needed.
 const ROOM_CHANNEL = "proctoring-room";
 const alertChannelName = (studentId: string) => `alert-${studentId}`;
+
+const MAX_MESSAGE_LENGTH = 1000;
 
 export interface RosterEntry {
   studentId: string;
@@ -18,12 +20,8 @@ export interface RosterEntry {
   connected: boolean;
   lastStatus: any;
   // Authoritative count of every flag this student has generated, from
-  // *any* source (gaze loop, tab-switch, clipboard, prolonged-absence
-  // escalation, etc). Maintained here — incremented directly off the
-  // "flag" channel — rather than read out of lastStatus.flagCount, which
-  // only ever reflected the gaze hook's own internal counter and gets
-  // clobbered whenever a status update without that field comes in (e.g.
-  // the synthetic "Tab Away" status pushed on visibilitychange).
+  // *any* source. Maintained off the "flag" channel rather than read out of
+  // lastStatus.flagCount, which only reflects the gaze hook's own counter.
   flagCount: number;
 }
 
@@ -35,29 +33,33 @@ export interface FlagEvent {
 }
 
 /**
- * clientId should be the logged-in user's stable id (studentId for
- * students, or any unique id for a proctor). The Ably client isn't created
- * until clientId is known, since the auth token is minted for that id.
+ * clientId is only used as a "session exists" gate and to name this
+ * student's alert channel. The real identity is bound server-side: the
+ * Ably token is minted from the signed session cookie by
+ * /api/ably-token, so the id a client claims here can't change who it is.
  */
 export function useProctorSocket(clientId: string | null) {
   const clientRef = useRef<Ably.Realtime | null>(null);
   const roomRef = useRef<Ably.RealtimeChannel | null>(null);
 
+  // Guards against re-subscribing every time `connected` flips true->false->true
+  // on a reconnect, which would cause duplicate event/flag/alert delivery.
+  const studentRegisteredRef = useRef(false);
+  const proctorRegisteredRef = useRef(false);
+
   const [connected, setConnected] = useState(false);
   const [roster, setRoster] = useState<Map<string, RosterEntry>>(new Map());
   const [events, setEvents] = useState<FlagEvent[]>([]);
   const [alert, setAlert] = useState<{ message: string; timestamp: number } | null>(null);
-
+  // Bumped whenever the proctor nudges this student to re-read its exam state.
+  const [controlTick, setControlTick] = useState(0);
   const [connectionError, setConnectionError] = useState<string | null>(null);
 
   // One Ably connection per mounted page, torn down on unmount / clientId change.
   useEffect(() => {
     if (!clientId) return;
 
-    const client = new Ably.Realtime({
-      authUrl: `/api/ably-token?clientId=${encodeURIComponent(clientId)}`,
-      clientId,
-    });
+    const client = new Ably.Realtime({ authUrl: "/api/ably-token" });
     clientRef.current = client;
 
     client.connection.on("connected", () => {
@@ -76,13 +78,13 @@ export function useProctorSocket(clientId: string | null) {
     return () => {
       client.close();
       clientRef.current = null;
+      roomRef.current = null;
+      // Reset so a remount (dev StrictMode, clientId change) registers again.
+      studentRegisteredRef.current = false;
+      proctorRegisteredRef.current = false;
+      setConnected(false);
     };
   }, [clientId]);
-
-  // Guards against re-subscribing every time `connected` flips true->false->true
-  // on a reconnect, which previously caused duplicate event/flag/alert delivery.
-  const studentRegisteredRef = useRef(false);
-  const proctorRegisteredRef = useRef(false);
 
   const registerStudent = useCallback(
     (name?: string) => {
@@ -95,11 +97,14 @@ export function useProctorSocket(clientId: string | null) {
       roomRef.current = room;
       room.presence.enter({ role: "student", name });
 
-      // Subscribe only to alerts addressed to this student's own channel.
+      // Subscribe only to messages addressed to this student's own channel.
       const alertChannel = client.channels.get(alertChannelName(clientId));
       alertChannel.subscribe("alert", (msg) => {
-        setAlert({ message: msg.data.message, timestamp: msg.timestamp ?? Date.now() });
+        setAlert({ message: String(msg.data?.message ?? ""), timestamp: msg.timestamp ?? Date.now() });
       });
+      // The payload is intentionally meaningless: it is only a nudge, and the
+      // student re-reads its lock state from the server rather than trusting it.
+      alertChannel.subscribe("control", () => setControlTick((t) => t + 1));
     },
     [clientId]
   );
@@ -142,7 +147,11 @@ export function useProctorSocket(clientId: string | null) {
     refreshRosterFromPresence();
 
     room.subscribe("status", (msg) => {
-      const { studentId, ...status } = msg.data;
+      // Ably stamps the verified publisher on every message. Never trust a
+      // studentId written inside the body: a student could frame someone else.
+      const studentId = msg.clientId;
+      if (!studentId) return;
+      const { studentId: _ignored, ...status } = (msg.data ?? {}) as Record<string, any>;
       setRoster((prev) => {
         const next = new Map(prev);
         const existing = next.get(studentId);
@@ -151,10 +160,7 @@ export function useProctorSocket(clientId: string | null) {
           name: existing?.name,
           connected: existing?.connected ?? true,
           lastStatus: status,
-          // Status updates (including synthetic ones like "Tab Away" that
-          // don't carry their own flag telemetry) must never touch the
-          // flag count — that's tracked exclusively below, off the actual
-          // "flag" messages.
+          // Status updates must never touch the flag count.
           flagCount: existing?.flagCount ?? 0,
         });
         return next;
@@ -162,7 +168,14 @@ export function useProctorSocket(clientId: string | null) {
     });
 
     room.subscribe("flag", (msg) => {
-      const { studentId, message, timestamp, category } = msg.data as FlagEvent;
+      const studentId = msg.clientId;
+      if (!studentId) return;
+      const data = (msg.data ?? {}) as Partial<FlagEvent>;
+      // Sanitize: an unknown category would crash the dashboard's meta lookup.
+      const category: FlagCategory = isFlagCategory(data.category) ? data.category : "system";
+      const message = String(data.message ?? "").slice(0, MAX_MESSAGE_LENGTH);
+      const timestamp = typeof data.timestamp === "number" ? data.timestamp : Date.now();
+
       setEvents((prev) => [{ studentId, message, timestamp, category }, ...prev].slice(0, 200));
       setRoster((prev) => {
         const next = new Map(prev);
@@ -179,12 +192,15 @@ export function useProctorSocket(clientId: string | null) {
     });
   }, []);
 
+  // The studentId parameters are kept for call-site compatibility; the
+  // receiving side ignores them and uses the verified msg.clientId instead.
   const sendStatus = useCallback((studentId: string, status: object) => {
     roomRef.current?.publish("status", { studentId, ...status });
   }, []);
 
   const sendFlag = useCallback(
     (studentId: string, message: string, timestamp: number, category: FlagCategory) => {
+      if (!(category in FLAG_CATEGORY_META)) category = "system";
       roomRef.current?.publish("flag", { studentId, message, timestamp, category });
     },
     []
@@ -196,6 +212,13 @@ export function useProctorSocket(clientId: string | null) {
     client.channels.get(alertChannelName(studentId)).publish("alert", { message });
   }, []);
 
+  /** Proctor -> student nudge: "re-read your exam state from the server now". */
+  const sendControl = useCallback((studentId: string) => {
+    const client = clientRef.current;
+    if (!client) return;
+    client.channels.get(alertChannelName(studentId)).publish("control", { action: "sync" });
+  }, []);
+
   const clearAlert = useCallback(() => setAlert(null), []);
 
   return {
@@ -205,10 +228,12 @@ export function useProctorSocket(clientId: string | null) {
     events,
     alert,
     clearAlert,
+    controlTick,
     registerStudent,
     registerProctor,
     sendStatus,
     sendFlag,
     sendAlert,
+    sendControl,
   };
 }

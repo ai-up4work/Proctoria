@@ -60,12 +60,10 @@ export interface DetectionResult {
 // Flag classification
 //
 // Every flag emitted anywhere in the app (gaze loop, tab-switch listener,
-// clipboard listener, lifecycle events) carries one of these categories.
-// This is the single source of truth for severity/color/label — the
-// dashboard's Event Feed should switch on `category`, never re-derive
-// severity by pattern-matching the free-text `message` string. Keeping the
-// classification here (next to the detection thresholds) instead of in the
-// dashboard component means the two can't drift out of sync again.
+// clipboard listener, lifecycle events, strike/lock notices) carries one of
+// these categories. This is the single source of truth for severity/color/
+// label — the dashboard's Event Feed should switch on `category`, never
+// re-derive severity by pattern-matching the free-text `message` string.
 // ---------------------------------------------------------------------------
 
 export type FlagCategory =
@@ -76,7 +74,9 @@ export type FlagCategory =
   | "tab_switch"
   | "tab_away_prolonged"
   | "clipboard"
-  | "system";
+  | "system"
+  | "strike"
+  | "exam_locked";
 
 export type FlagSeverity = "critical" | "warning" | "info";
 
@@ -94,10 +94,37 @@ export const FLAG_CATEGORY_META: Record<FlagCategory, FlagCategoryMeta> = {
   tab_switch: { severity: "warning", label: "Tab / Window Switch" },
   // Distinct from a plain tab_switch: this fires once an absence has run
   // long enough that it's no longer "glanced away," it's "left the exam."
-  // Kept as its own category (rather than just louder tab_switch wording)
-  // so the dashboard's severity coloring escalates automatically instead
-  // of every tab-switch flag looking the same regardless of duration.
   tab_away_prolonged: { severity: "critical", label: "Prolonged Absence" },
   clipboard: { severity: "warning", label: "Clipboard Attempt" },
   system: { severity: "info", label: "System" },
+  // Notices the student client emits about its own enforcement. They are
+  // deliberately NOT eligible to cause strikes (see countsAsStrike).
+  strike: { severity: "warning", label: "Strike Issued" },
+  exam_locked: { severity: "critical", label: "Exam Locked" },
 };
+
+export function isFlagCategory(value: unknown): value is FlagCategory {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(FLAG_CATEGORY_META, value);
+}
+
+// ---------------------------------------------------------------------------
+// Strike policy
+// ---------------------------------------------------------------------------
+
+/** Strikes at which the exam locks. */
+export const MAX_STRIKES = 3;
+
+/** Critical flags closer together than this belong to the same incident. */
+export const INCIDENT_GAP_MS = 15_000;
+
+/**
+ * A single, endless incident still earns another strike this often.
+ * Use Infinity to make one incident worth exactly one strike.
+ */
+export const INCIDENT_RESTRIKE_MS = 60_000;
+
+/** Only critical flags count; our own strike/lock notices never do. */
+export function countsAsStrike(category: FlagCategory) {
+  if (category === "exam_locked" || category === "strike") return false;
+  return FLAG_CATEGORY_META[category].severity === "critical";
+}

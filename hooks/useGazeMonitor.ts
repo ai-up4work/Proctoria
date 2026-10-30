@@ -13,7 +13,6 @@ import {
   PITCH_LIMIT,
   RIGHT_EYE_CORNERS,
   RIGHT_IRIS,
-  WINDOW_MS,
   YAW_LIMIT,
   irisOffset,
   matrixToEuler,
@@ -68,7 +67,6 @@ function captureVideoFrame(video: HTMLVideoElement | null, quality = 0.7): strin
     return canvas.toDataURL("image/jpeg", quality);
   } catch {
     // toDataURL can throw on a tainted canvas (e.g. cross-origin video source).
-    // The webcam stream is same-origin/local, so this should not normally happen.
     return null;
   }
 }
@@ -77,8 +75,14 @@ function captureVideoFrame(video: HTMLVideoElement | null, quality = 0.7): strin
  * Headless-friendly face/gaze monitor. Attach `videoRef` to a <video> element
  * anywhere in the tree (it can be display:none / off-screen — getUserMedia
  * and MediaPipe both still work on a hidden video element, it just must be
- * playing). Attach `canvasRef` only if you want the overlay drawn (skip it
- * entirely on pages where the feed is never shown to the student).
+ * playing). Attach `canvasRef` only if you want the overlay drawn.
+ *
+ * `onStatus` / `onFlag` are read through refs, so callers can pass inline
+ * functions without causing start()/stop() to change identity or the running
+ * loop to call stale closures.
+ *
+ * stop() halts the rAF loop (so no more model inference runs) and releases
+ * the camera, but keeps the model loaded so start() can resume quickly.
  */
 export function useGazeMonitor(options: GazeMonitorOptions = {}) {
   const {
@@ -92,9 +96,15 @@ export function useGazeMonitor(options: GazeMonitorOptions = {}) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
+  const onStatusRef = useRef(onStatus);
+  const onFlagRef = useRef(onFlag);
+  onStatusRef.current = onStatus;
+  onFlagRef.current = onFlag;
+
   const faceLandmarkerRef = useRef<any>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const runningRef = useRef(false);
+  const startingRef = useRef(false);
   const awayStreakStartRef = useRef<number | null>(null);
   const totalAwayMsRef = useRef(0);
   const flagCountRef = useRef(0);
@@ -109,12 +119,9 @@ export function useGazeMonitor(options: GazeMonitorOptions = {}) {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [flagCount, setFlagCount] = useState(0);
 
-  const logEvent = useCallback(
-    (message: string, category: FlagCategory, snapshot?: string) => {
-      onFlag?.({ message, timestamp: Date.now(), category, snapshot });
-    },
-    [onFlag]
-  );
+  const logEvent = useCallback((message: string, category: FlagCategory, snapshot?: string) => {
+    onFlagRef.current?.({ message, timestamp: Date.now(), category, snapshot });
+  }, []);
 
   function drawFrame(landmarks: { x: number; y: number }[]) {
     if (!drawOverlay) return;
@@ -238,9 +245,7 @@ export function useGazeMonitor(options: GazeMonitorOptions = {}) {
         lastFlagAtRef.current = now;
         setFlagCount(flagCountRef.current);
 
-        // Capture the current webcam frame at the moment the flag fires —
-        // covers head_away, gaze_away, no_face, and multiple_faces alike,
-        // since they all funnel through this same sustained-streak check.
+        // Capture the current webcam frame at the moment the flag fires.
         const snapshot = captureSnapshots
           ? captureVideoFrame(videoRef.current, snapshotQuality) ?? undefined
           : undefined;
@@ -250,6 +255,10 @@ export function useGazeMonitor(options: GazeMonitorOptions = {}) {
           awayCategory,
           snapshot
         );
+
+        // The flag handler may have called stop() (e.g. the exam just locked).
+        // Bail out before reporting status or scheduling another frame.
+        if (!runningRef.current) return;
       }
     } else {
       awayStreakStartRef.current = null;
@@ -263,7 +272,7 @@ export function useGazeMonitor(options: GazeMonitorOptions = {}) {
 
     const sessionTime = sessionStartRef.current !== null ? now - sessionStartRef.current : 0;
 
-    onStatus?.({
+    onStatusRef.current?.({
       result,
       metrics,
       flagCount: flagCountRef.current,
@@ -271,6 +280,7 @@ export function useGazeMonitor(options: GazeMonitorOptions = {}) {
       sessionTime,
     });
 
+    if (!runningRef.current) return;
     rafRef.current = requestAnimationFrame(loop);
   }
 
@@ -318,40 +328,60 @@ export function useGazeMonitor(options: GazeMonitorOptions = {}) {
   }, []);
 
   const start = useCallback(async () => {
-    if (runningRef.current) return;
+    if (runningRef.current || startingRef.current) return;
     if (!faceLandmarkerRef.current) {
       setErrorMsg("Model is still loading, try again in a moment.");
       return;
     }
-    let stream: MediaStream;
+    startingRef.current = true;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
-    } catch (e: any) {
-      setErrorMsg("Camera access was denied or unavailable: " + e.message);
-      return;
-    }
-    streamRef.current = stream;
-    const video = videoRef.current;
-    if (video) {
-      video.srcObject = stream;
-      await video.play();
-      const canvas = canvasRef.current;
-      if (canvas) {
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+      } catch (e: any) {
+        setErrorMsg("Camera access was denied or unavailable: " + e.message);
+        return;
       }
+      streamRef.current = stream;
+      const video = videoRef.current;
+      if (video) {
+        video.srcObject = stream;
+        await video.play();
+        const canvas = canvasRef.current;
+        if (canvas) {
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+        }
+      }
+
+      // Fresh per-run trackers (matters when restarting after an unlock).
+      awayStreakStartRef.current = null;
+      lastTRef.current = undefined;
+      lastFlagAtRef.current = 0;
+      if (sessionStartRef.current === null) sessionStartRef.current = performance.now();
+
+      setErrorMsg(null);
+      runningRef.current = true;
+      setRunning(true);
+      logEvent("Camera started — monitoring session begun.", "system");
+      rafRef.current = requestAnimationFrame(loop);
+    } finally {
+      startingRef.current = false;
     }
-    runningRef.current = true;
-    setRunning(true);
-    sessionStartRef.current = performance.now();
-    logEvent("Camera started — monitoring session begun.", "system");
-    rafRef.current = requestAnimationFrame(loop);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [logEvent]);
 
   const stop = useCallback(() => {
-    runningRef.current = false;
+    runningRef.current = false; // loop() exits -> no more model inference
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    streamRef.current?.getTracks().forEach((t) => t.stop());
+    rafRef.current = null;
+    streamRef.current?.getTracks().forEach((t) => t.stop()); // camera light off
+    streamRef.current = null;
+    const video = videoRef.current;
+    if (video) {
+      video.pause();
+      video.srcObject = null;
+    }
     setRunning(false);
     logEvent("Camera stopped.", "system");
   }, [logEvent]);

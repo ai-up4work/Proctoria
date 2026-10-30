@@ -1,22 +1,34 @@
 // app/exam/[examId]/sit/page.tsx
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useParams } from "next/navigation";
 import { useSession } from "@/context/SessionContext";
 import { useGazeMonitor } from "@/hooks/useGazeMonitor";
 import { useProctorSocket } from "@/hooks/useProctorSocket";
 
 import { MOCK_QUESTIONS } from "@/lib/mockQuestions";
-import { FlagCategory } from "@/lib/gaze";
+import {
+  FLAG_CATEGORY_META,
+  FlagCategory,
+  INCIDENT_GAP_MS,
+  INCIDENT_RESTRIKE_MS,
+  MAX_STRIKES,
+  countsAsStrike,
+} from "@/lib/gaze";
 
 const SESSION_SECONDS = 45 * 60;
 
+// The gaze loop runs every animation frame; the dashboard doesn't need that
+// many updates. A state change (ok -> warn -> bad) is always sent immediately.
+const STATUS_THROTTLE_MS = 700;
+
 // Escalation ladder for a student who stays away from the exam tab.
 // The longer the absence runs, the more severe the category (which drives
-// the dashboard's red/amber coloring) and the tighter the re-flag interval
-// — a 5-second glance away shouldn't read the same as a 2-minute absence.
-// Intervals are chosen well above the browser's ~1s background-timer clamp
-// so they fire reliably even while the tab is backgrounded.
+// the dashboard's red/amber coloring and, for critical ones, strikes) and
+// the tighter the re-flag interval. Intervals are chosen well above the
+// browser's ~1s background-timer clamp so they fire reliably even while the
+// tab is backgrounded.
 const AWAY_TIERS: { afterSeconds: number; intervalMs: number; category: FlagCategory }[] = [
   { afterSeconds: 0, intervalMs: 10000, category: "tab_switch" },
   { afterSeconds: 30, intervalMs: 7000, category: "tab_away_prolonged" },
@@ -47,9 +59,19 @@ function formatTime(totalSeconds: number) {
 
 export default function ExamSitPage() {
   const { session } = useSession();
-  const { registerStudent, sendStatus, sendFlag, connected, connectionError, alert, clearAlert } = useProctorSocket(
-    session?.studentId ?? null
-  );
+  const params = useParams<{ examId: string }>();
+  const examId = params?.examId ?? "default";
+
+  const {
+    registerStudent,
+    sendStatus,
+    sendFlag,
+    connected,
+    connectionError,
+    alert,
+    clearAlert,
+    controlTick,
+  } = useProctorSocket(session?.studentId ?? null);
 
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [flagged, setFlagged] = useState<Set<string>>(new Set());
@@ -57,36 +79,226 @@ export default function ExamSitPage() {
   const [banner, setBanner] = useState<{ message: string; timestamp: number } | null>(null);
   const [secondsLeft, setSecondsLeft] = useState(SESSION_SECONDS);
 
-  const { videoRef, start, running, modelReady, modelStatus, errorMsg } = useGazeMonitor({
-    // drawOverlay left false — this page never shows the feed to the student
-    onStatus: (status) => {
-      if (session) {
-        sendStatus(session.studentId, {
-          result: status.result,
-          metrics: status.metrics,
-          flagCount: status.flagCount,
-          awayTime: status.awayTime,
-          sessionTime: status.sessionTime,
+  // ---- strike / lock state -------------------------------------------------
+  // The server (lib/examState.ts) is the source of truth. This client locks
+  // itself instantly for UX, reports to the server, and re-reads the server
+  // on load, on a proctor nudge, and on a poll.
+  const [strikes, setStrikes] = useState(0);
+  const [locked, setLocked] = useState(false);
+  const [stateReady, setStateReady] = useState(false);
+  const [strikeModal, setStrikeModal] = useState<{ strike: number; reason: string; label: string } | null>(
+    null
+  );
+
+  const strikesRef = useRef(0);
+  const lockedRef = useRef(false);
+  const lockPendingRef = useRef(false); // local lock the server hasn't confirmed yet
+  const studentIdRef = useRef<string | null>(null);
+  studentIdRef.current = session?.studentId ?? null;
+  const lastCriticalAtRef = useRef(0);
+  const lastStrikeAtRef = useRef(0);
+  const stopMonitorRef = useRef<() => void>(() => {});
+  const lastStatusSentAtRef = useRef(0);
+  const lastStatusStateRef = useRef<string | null>(null);
+
+  const reportToServer = useCallback(async (strikesNow: number, lockedNow: boolean) => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const res = await fetch("/api/exam/state", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "report", strikes: strikesNow, locked: lockedNow }),
         });
+        if (res.ok) return true;
+      } catch {
+        /* retry below */
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    return false;
+  }, []);
+
+  const applyLock = useCallback((strikesNow: number) => {
+    lockedRef.current = true; // set BEFORE stopping so the "Camera stopped" flag is dropped
+    strikesRef.current = strikesNow;
+    setLocked(true);
+    setStrikes(strikesNow);
+    setStrikeModal(null);
+    stopMonitorRef.current(); // camera tracks + inference loop off
+  }, []);
+
+  const lockExam = useCallback(
+    (reason: string) => {
+      const id = studentIdRef.current;
+      if (!id) return;
+      sendFlag(
+        id,
+        `Strike ${MAX_STRIKES}/${MAX_STRIKES} — exam locked. Last incident: ${reason}`,
+        Date.now(),
+        "exam_locked"
+      );
+      sendStatus(id, {
+        result: {
+          state: "bad",
+          title: "Exam Locked",
+          sub: `Locked after ${MAX_STRIKES} strikes — awaiting proctor`,
+          faceDetected: false,
+          gazeLabel: "unknown",
+          confidence: 0,
+        },
+      });
+      applyLock(MAX_STRIKES);
+      lockPendingRef.current = true;
+      reportToServer(MAX_STRIKES, true).then((ok) => {
+        if (ok) lockPendingRef.current = false;
+      });
+    },
+    [applyLock, reportToServer, sendFlag, sendStatus]
+  );
+
+  const issueStrike = useCallback(
+    (reason: string, category: FlagCategory) => {
+      const id = studentIdRef.current;
+      if (!id) return;
+      const next = strikesRef.current + 1;
+      if (next >= MAX_STRIKES) {
+        lockExam(reason);
+        return;
+      }
+      strikesRef.current = next;
+      setStrikes(next);
+      sendFlag(id, `Strike ${next}/${MAX_STRIKES} issued — ${reason}`, Date.now(), "strike");
+      setStrikeModal({ strike: next, reason, label: FLAG_CATEGORY_META[category].label });
+      reportToServer(next, false);
+    },
+    [lockExam, reportToServer, sendFlag]
+  );
+
+  /**
+   * Single exit point for every flag: sends it to the proctor, then applies
+   * the strike policy (critical flags only, one strike per incident).
+   */
+  const emitFlag = useCallback(
+    (message: string, timestamp: number, category: FlagCategory) => {
+      const id = studentIdRef.current;
+      if (!id || lockedRef.current) return;
+      sendFlag(id, message, timestamp, category);
+      if (!countsAsStrike(category)) return;
+
+      const now = Date.now();
+      const startsNewIncident = now - lastCriticalAtRef.current > INCIDENT_GAP_MS;
+      const incidentDraggedOn = now - lastStrikeAtRef.current > INCIDENT_RESTRIKE_MS;
+      lastCriticalAtRef.current = now; // any critical flag keeps the current incident alive
+      if (!startsNewIncident && !incidentDraggedOn) return;
+
+      lastStrikeAtRef.current = now;
+      issueStrike(message, category);
+    },
+    [issueStrike, sendFlag]
+  );
+
+  /** Pull the authoritative state: restores after refresh, applies proctor lock/unlock. */
+  const syncFromServer = useCallback(async () => {
+    try {
+      const res = await fetch("/api/exam/state", { cache: "no-store" });
+      if (!res.ok) return;
+      const s = (await res.json()) as { locked: boolean; strikes: number };
+
+      if (s.locked) {
+        lockPendingRef.current = false;
+        if (!lockedRef.current) applyLock(s.strikes);
+      } else if (lockedRef.current && !lockPendingRef.current) {
+        // The proctor re-enabled this student.
+        lockedRef.current = false;
+        strikesRef.current = s.strikes;
+        lastCriticalAtRef.current = 0;
+        lastStrikeAtRef.current = 0;
+        setLocked(false);
+        setStrikes(s.strikes);
+        setStrikeModal(null);
+      } else if (s.strikes > strikesRef.current) {
+        strikesRef.current = s.strikes;
+        setStrikes(s.strikes);
+      }
+      setStateReady(true);
+    } catch {
+      /* retried by the poll */
+    }
+  }, [applyLock]);
+
+  const saveAnswer = useCallback(
+    async (questionId: string, answer: string) => {
+      try {
+        const res = await fetch("/api/exam/answer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ examId, questionId, answer }),
+        });
+        // The server says we're locked -> lock the UI to match.
+        if (res.status === 423) syncFromServer();
+      } catch {
+        /* network blip; the next selection will save again */
       }
     },
-    onFlag: (flag) => {
-      if (session) sendFlag(session.studentId, flag.message, flag.timestamp, flag.category);
-    },
-  });
+    [examId, syncFromServer]
+  );
 
-  // Register with the hub and auto-start monitoring once both the socket
-  // and the model are ready.
+  const { videoRef, start, stop, running, modelReady, modelStatus, errorMsg } = useGazeMonitor({
+    // drawOverlay left false — this page never shows the feed to the student
+    onStatus: (status) => {
+      const id = studentIdRef.current;
+      // A straggler frame must never overwrite the "Exam Locked" status.
+      if (!id || lockedRef.current) return;
+      const now = Date.now();
+      const stateChanged = status.result.state !== lastStatusStateRef.current;
+      if (!stateChanged && now - lastStatusSentAtRef.current < STATUS_THROTTLE_MS) return;
+      lastStatusStateRef.current = status.result.state;
+      lastStatusSentAtRef.current = now;
+      sendStatus(id, {
+        result: status.result,
+        metrics: status.metrics,
+        flagCount: status.flagCount,
+        awayTime: status.awayTime,
+        sessionTime: status.sessionTime,
+      });
+    },
+    onFlag: (flag) => emitFlag(flag.message, flag.timestamp, flag.category),
+  });
+  stopMonitorRef.current = stop;
+
+  // Questions and navigation are unusable while monitoring is down, the exam
+  // is locked, or the server state hasn't been confirmed yet.
+  const blocked = Boolean(errorMsg) || locked || !stateReady;
+
+  // Register with the hub once connected.
   useEffect(() => {
     if (session && connected) registerStudent(session.name);
   }, [session, connected, registerStudent]);
 
+  // Auto-start monitoring once the model and the server state are ready and
+  // the exam isn't locked. (After an unlock, `locked` flips false and this
+  // restarts the camera.)
   useEffect(() => {
-    if (modelReady && !running) start();
-  }, [modelReady, running, start]);
+    if (modelReady && stateReady && !locked && !lockedRef.current && !running) start();
+  }, [modelReady, stateReady, locked, running, start]);
 
-  // Surface only alerts addressed to *this* student (server already filters
-  // by studentId before it reaches this client at all).
+  // Initial state load + polling. Fast until the first load succeeds, then
+  // quick while locked (so an unlock lands fast even if the Ably nudge is
+  // missed) and relaxed while the exam is running.
+  useEffect(() => {
+    if (!session) return;
+    syncFromServer();
+    const id = setInterval(syncFromServer, !stateReady ? 2000 : locked ? 4000 : 15000);
+    return () => clearInterval(id);
+  }, [session, locked, stateReady, syncFromServer]);
+
+  // Proctor "nudge" over Ably -> re-read the server immediately.
+  useEffect(() => {
+    if (controlTick > 0) syncFromServer();
+  }, [controlTick, syncFromServer]);
+
+  // Surface only alerts addressed to *this* student (the Ably capability
+  // already restricts which channel this client can read).
   useEffect(() => {
     if (alert) {
       setBanner(alert);
@@ -96,20 +308,14 @@ export default function ExamSitPage() {
 
   // Tab-switch / window-blur detection.
   //
-  // NOTE: this is intentionally the *only* signal we trust while the tab is
-  // hidden. The gaze loop (useGazeMonitor) is driven by requestAnimationFrame,
-  // which browsers throttle heavily in background tabs — and even if it kept
-  // running, most browsers pause video frame decoding for a backgrounded
-  // tab, so MediaPipe would just keep re-analyzing the last frame it saw
-  // before the switch. That means gaze/face state can silently go stale and
-  // keep reporting "Verified" the whole time the student is away. So instead
-  // of trying to keep gaze detection alive in the background, we treat
-  // document.hidden as authoritative: push an immediate "away" status the
-  // moment the tab is hidden (so the proctor dashboard doesn't keep showing
-  // stale green), and keep re-flagging on an interval for as long as the
-  // student stays away, so a 5-minute absence produces more than one log
-  // line. On return, we log how long they were gone and let the gaze loop
-  // resume producing real status updates on its own.
+  // This is intentionally the *only* signal we trust while the tab is
+  // hidden. The gaze loop is driven by requestAnimationFrame, which browsers
+  // throttle heavily in background tabs, and most browsers pause video frame
+  // decoding for a backgrounded tab, so MediaPipe would keep re-analyzing the
+  // last frame it saw. So we treat document.hidden as authoritative: push an
+  // immediate "away" status, and keep re-flagging on an interval for as long
+  // as the student stays away. Prolonged-absence flags are critical, so they
+  // go through emitFlag and can earn strikes.
   useEffect(() => {
     if (!session) return;
 
@@ -117,15 +323,15 @@ export default function ExamSitPage() {
     let hiddenSince: number | null = null;
 
     function scheduleNextCheck() {
-      if (hiddenSince === null || !session) return;
+      if (hiddenSince === null || !session || lockedRef.current) return;
       const awaySeconds = Math.round((Date.now() - hiddenSince) / 1000);
       const tier = tierFor(awaySeconds);
 
-      sendFlag(session.studentId, awayMessage(awaySeconds), Date.now(), tier.category);
+      emitFlag(awayMessage(awaySeconds), Date.now(), tier.category);
+      if (lockedRef.current) return; // this very flag may have just locked the exam
 
-      // Once this crosses into the critical tier, push a status update too
-      // — not just a feed entry — so the student's card on the dashboard
-      // itself turns critical, in case the proctor isn't watching the feed.
+      // Once this crosses into the critical tier, push a status update too,
+      // so the student's card on the dashboard itself turns critical.
       if (tier.category === "tab_away_prolonged") {
         sendStatus(session.studentId, {
           result: {
@@ -146,13 +352,13 @@ export default function ExamSitPage() {
       if (!session) return;
 
       if (document.hidden) {
+        if (lockedRef.current) return;
         hiddenSince = Date.now();
 
-        sendFlag(session.studentId, "Student switched tabs or minimized the window.", Date.now(), "tab_switch");
+        emitFlag("Student switched tabs or minimized the window.", Date.now(), "tab_switch");
 
         // Immediately mark the student as "away" for the dashboard, rather
-        // than leaving whatever gaze-loop status was last computed (which
-        // will not update again until the tab is visible).
+        // than leaving whatever gaze-loop status was last computed.
         sendStatus(session.studentId, {
           result: {
             state: "bad",
@@ -172,16 +378,11 @@ export default function ExamSitPage() {
         }
         if (hiddenSince !== null) {
           const awaySeconds = Math.round((Date.now() - hiddenSince) / 1000);
-          sendFlag(
-            session.studentId,
-            `Returned to the exam tab after ${awaySeconds}s away.`,
-            Date.now(),
-            "tab_switch"
-          );
+          emitFlag(`Returned to the exam tab after ${awaySeconds}s away.`, Date.now(), "tab_switch");
           hiddenSince = null;
         }
-        // The gaze loop's own onStatus callback will resume publishing
-        // fresh status on its next processed frame — nothing to do here.
+        // The gaze loop's own onStatus callback resumes publishing fresh
+        // status on its next processed frame — nothing to do here.
       }
     }
 
@@ -190,23 +391,24 @@ export default function ExamSitPage() {
       document.removeEventListener("visibilitychange", handleVisibility);
       if (awayTimeout) clearTimeout(awayTimeout);
     };
-  }, [session, sendFlag, sendStatus]);
+  }, [session, emitFlag, sendStatus]);
 
   // Session countdown — paused while monitoring is blocked (camera error),
-  // so a student can't run the clock out by denying camera access.
+  // while the exam is locked, and until the server state is confirmed, so a
+  // student can't run the clock out by denying the camera.
   useEffect(() => {
-    if (errorMsg) return;
+    if (errorMsg || locked || !stateReady) return;
     const id = setInterval(() => setSecondsLeft((s) => Math.max(0, s - 1)), 1000);
     return () => clearInterval(id);
-  }, [errorMsg]);
+  }, [errorMsg, locked, stateReady]);
 
   // Copy/paste restriction inside terminal mode.
   //
-  // We deliberately listen on the "copy" / "paste" events themselves rather
-  // than keydown — clipboardData (the actual text) is only exposed on those
-  // events, and keydown also misses right-click "Paste" from the context
-  // menu. Content is truncated before being sent so a proctor reviewing the
-  // flag gets useful context without a giant blob landing in the feed.
+  // We listen on the "copy" / "cut" / "paste" events themselves rather than
+  // keydown — clipboardData (the actual text) is only exposed on those
+  // events, and keydown also misses right-click "Paste". Content is truncated
+  // before being sent. Clipboard flags are warnings, so they never cause
+  // strikes on their own.
   useEffect(() => {
     function truncate(text: string, max = 200) {
       const trimmed = text.trim();
@@ -219,7 +421,7 @@ export default function ExamSitPage() {
       e.preventDefault();
       const selected = truncate(window.getSelection()?.toString() ?? "");
       const preview = selected ? ` Captured text: "${selected}"` : " (could not capture selected text.)";
-      sendFlag(session.studentId, `Attempted to copy while in terminal mode.${preview}`, Date.now(), "clipboard");
+      emitFlag(`Attempted to copy while in terminal mode.${preview}`, Date.now(), "clipboard");
     }
 
     function handleCut(e: ClipboardEvent) {
@@ -227,7 +429,7 @@ export default function ExamSitPage() {
       e.preventDefault();
       const selected = truncate(window.getSelection()?.toString() ?? "");
       const preview = selected ? ` Captured text: "${selected}"` : " (could not capture selected text.)";
-      sendFlag(session.studentId, `Attempted to cut while in terminal mode.${preview}`, Date.now(), "clipboard");
+      emitFlag(`Attempted to cut while in terminal mode.${preview}`, Date.now(), "clipboard");
     }
 
     function handlePaste(e: ClipboardEvent) {
@@ -235,7 +437,7 @@ export default function ExamSitPage() {
       e.preventDefault();
       const pasted = truncate(e.clipboardData?.getData("text/plain") ?? "");
       const preview = pasted ? ` Captured content: "${pasted}"` : " (clipboard was empty or non-text.)";
-      sendFlag(session.studentId, `Attempted to paste while in terminal mode.${preview}`, Date.now(), "clipboard");
+      emitFlag(`Attempted to paste while in terminal mode.${preview}`, Date.now(), "clipboard");
     }
 
     document.addEventListener("copy", handleCopy);
@@ -246,7 +448,7 @@ export default function ExamSitPage() {
       document.removeEventListener("cut", handleCut);
       document.removeEventListener("paste", handlePaste);
     };
-  }, [session, sendFlag]);
+  }, [session, emitFlag]);
 
   const question = MOCK_QUESTIONS[current];
   const progressPct = useMemo(() => Math.round(((current + 1) / MOCK_QUESTIONS.length) * 100), [current]);
@@ -273,8 +475,8 @@ export default function ExamSitPage() {
   }
 
   function retryCamera() {
-    // start() itself no-ops if already running, and re-requests getUserMedia
-    // on the next call since runningRef will still be false after a failure.
+    // start() no-ops if already running, and re-requests getUserMedia on
+    // the next call since runningRef will still be false after a failure.
     start();
   }
 
@@ -291,10 +493,75 @@ export default function ExamSitPage() {
       {/* Hidden video element — camera runs, nothing rendered to the student. */}
       <video ref={videoRef} autoPlay playsInline muted className="hidden" />
 
+      {/* Loading gate — nothing is usable until the server confirms whether
+          this student is locked, so a refresh can't be used to dodge a ban. */}
+      {!stateReady && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center bg-background p-6 text-center text-body-sm text-muted-foreground">
+          Checking exam status… If this takes more than a few seconds, log in again.
+        </div>
+      )}
+
+      {/* Strike popup — blocking, must be acknowledged. */}
+      {strikeModal && !locked && (
+        <div
+          role="alertdialog"
+          aria-modal="true"
+          className="fixed inset-0 z-[95] flex items-center justify-center bg-background/90 p-6 backdrop-blur-md"
+        >
+          <div className="w-full max-w-md rounded-xl border border-destructive/40 bg-card p-8 text-center shadow-2xl">
+            <span
+              className="material-symbols-outlined mb-4 text-4xl text-destructive"
+              style={{ fontVariationSettings: "'FILL' 1" }}
+            >
+              warning
+            </span>
+            <h2 className="mb-1 font-display text-headline-md font-bold text-foreground">
+              Integrity Warning {strikeModal.strike} of {MAX_STRIKES}
+            </h2>
+            <p className="mb-3 font-mono text-label-sm uppercase tracking-widest text-destructive">
+              {strikeModal.label}
+            </p>
+            <p className="mb-4 font-body text-body-sm text-muted-foreground">{strikeModal.reason}</p>
+            <p className="mb-6 font-body text-body-sm text-foreground">
+              Your proctor has been notified. {MAX_STRIKES - strikeModal.strike} more warning
+              {MAX_STRIKES - strikeModal.strike === 1 ? "" : "s"} and your exam will be locked.
+            </p>
+            <button
+              onClick={() => setStrikeModal(null)}
+              className="w-full rounded-lg bg-primary px-6 py-3 font-mono text-label-md font-bold text-primary-foreground transition-all hover:brightness-110 active:scale-95"
+            >
+              I understand
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Lock overlay — exam banned until the proctor re-enables it. */}
+      {locked && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-background p-6">
+          <div className="w-full max-w-md rounded-xl border border-destructive/40 bg-card p-8 text-center shadow-2xl">
+            <span
+              className="material-symbols-outlined mb-4 text-4xl text-destructive"
+              style={{ fontVariationSettings: "'FILL' 1" }}
+            >
+              lock
+            </span>
+            <h2 className="mb-2 font-display text-headline-md font-bold text-foreground">Exam Locked</h2>
+            <p className="mb-4 font-body text-body-sm text-muted-foreground">
+              Your exam was locked after {MAX_STRIKES} integrity warnings. Your proctor has been notified,
+              your camera has been turned off, and no further answers are being accepted.
+            </p>
+            <p className="font-mono text-label-sm text-muted-foreground">
+              This page resumes automatically if your proctor re-enables your exam. Please stay on this page.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Blocking overlay — camera/model failure. The exam is not usable
           until monitoring is restored, so a student can't silently continue
           unproctored. */}
-      {errorMsg && (
+      {errorMsg && !locked && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-background/95 p-6 backdrop-blur-md">
           <div className="w-full max-w-md rounded-xl border border-destructive/40 bg-card p-8 text-center shadow-2xl">
             <span
@@ -340,26 +607,55 @@ export default function ExamSitPage() {
           </div>
 
           <div className="flex items-center gap-gutter">
+            {/* Strike counter */}
+            <div
+              className={`hidden items-center gap-2 rounded-full border px-3 py-1.5 sm:flex ${
+                locked
+                  ? "border-destructive/30 bg-destructive/10"
+                  : strikes > 0
+                  ? "border-secondary/30 bg-secondary/10"
+                  : "border-border bg-muted"
+              }`}
+            >
+              <span
+                className={`font-mono text-label-sm uppercase tracking-widest ${
+                  locked ? "text-destructive" : strikes > 0 ? "text-secondary" : "text-muted-foreground"
+                }`}
+              >
+                Strikes {strikes}/{MAX_STRIKES}
+              </span>
+            </div>
+
             {/* Monitor status indicator */}
             <div
               className={`hidden items-center gap-2 rounded-full border px-3 py-1.5 sm:flex ${
-                connectionError || errorMsg ? "border-destructive/30 bg-destructive/10" : "border-accent/20 bg-muted"
+                connectionError || errorMsg || locked
+                  ? "border-destructive/30 bg-destructive/10"
+                  : "border-accent/20 bg-muted"
               }`}
             >
               <span
                 className={`material-symbols-outlined text-sm ${
-                  connectionError || errorMsg ? "text-destructive" : "animate-pulse text-accent"
+                  connectionError || errorMsg || locked ? "text-destructive" : "animate-pulse text-accent"
                 }`}
                 style={{ fontVariationSettings: "'FILL' 1" }}
               >
-                {errorMsg ? "videocam_off" : connectionError ? "wifi_off" : "wifi_tethering"}
+                {locked ? "lock" : errorMsg ? "videocam_off" : connectionError ? "wifi_off" : "wifi_tethering"}
               </span>
               <span
                 className={`font-mono text-label-sm uppercase tracking-widest ${
-                  connectionError || errorMsg ? "text-destructive" : "text-accent"
+                  connectionError || errorMsg || locked ? "text-destructive" : "text-accent"
                 }`}
               >
-                {errorMsg ? "Camera Error" : connectionError ? "Monitor Offline" : running ? "Monitor Synced" : modelStatus || "Connecting…"}
+                {locked
+                  ? "Exam Locked"
+                  : errorMsg
+                  ? "Camera Error"
+                  : connectionError
+                  ? "Monitor Offline"
+                  : running
+                  ? "Monitor Synced"
+                  : modelStatus || "Connecting…"}
               </span>
             </div>
 
@@ -429,12 +725,12 @@ export default function ExamSitPage() {
           </div>
         </div>
 
-        {/* Question area — disabled while camera monitoring is down */}
+        {/* Question area — disabled while monitoring is down or the exam is locked */}
         <div
           className={`grid flex-grow grid-cols-12 gap-gutter transition-opacity ${
-            errorMsg ? "pointer-events-none opacity-40" : ""
+            blocked ? "pointer-events-none opacity-40" : ""
           }`}
-          aria-hidden={Boolean(errorMsg)}
+          aria-hidden={blocked}
         >
           {/* Main question container */}
           <div className="col-span-12 flex flex-col gap-gutter lg:col-span-8">
@@ -467,7 +763,12 @@ export default function ExamSitPage() {
                         name={question.id}
                         className="sr-only"
                         checked={selected}
-                        onChange={() => setAnswers((prev) => ({ ...prev, [question.id]: opt }))}
+                        disabled={blocked}
+                        onChange={() => {
+                          setAnswers((prev) => ({ ...prev, [question.id]: opt }));
+                          // The server re-checks the lock and answers 423 if locked.
+                          saveAnswer(question.id, opt);
+                        }}
                       />
                       <span className={selected ? "text-foreground" : ""}>{opt}</span>
                     </label>
@@ -486,16 +787,16 @@ export default function ExamSitPage() {
                 Network {connected ? "Stable" : "Down"}
               </span>
               <span className="flex items-center gap-1.5 font-mono text-label-sm text-muted-foreground">
-                <span className="h-1.5 w-1.5 rounded-full bg-accent" />
-                Lockdown Active
+                <span className={`h-1.5 w-1.5 rounded-full ${locked ? "bg-destructive" : "bg-accent"}`} />
+                {locked ? "Exam Locked" : "Lockdown Active"}
               </span>
               <span className="flex items-center gap-1.5 font-mono text-label-sm text-muted-foreground">
                 <span
                   className={`h-1.5 w-1.5 rounded-full ${
-                    errorMsg ? "bg-destructive" : running ? "bg-accent" : "bg-muted-foreground"
+                    errorMsg || locked ? "bg-destructive" : running ? "bg-accent" : "bg-muted-foreground"
                   }`}
                 />
-                Camera {errorMsg ? "Error" : running ? "Active" : "Starting"}
+                Camera {locked ? "Off" : errorMsg ? "Error" : running ? "Active" : "Starting"}
               </span>
               <span className="flex items-center gap-1.5 font-mono text-label-sm text-muted-foreground">
                 <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground" />
@@ -548,12 +849,12 @@ export default function ExamSitPage() {
         </div>
       </main>
 
-      {/* Bottom navigation bar — disabled while camera monitoring is down */}
+      {/* Bottom navigation bar — disabled while monitoring is down or the exam is locked */}
       <footer
         className={`fixed bottom-0 z-50 flex h-20 w-full items-center border-t border-border bg-card/90 backdrop-blur-xl transition-opacity ${
-          errorMsg ? "pointer-events-none opacity-40" : ""
+          blocked ? "pointer-events-none opacity-40" : ""
         }`}
-        aria-hidden={Boolean(errorMsg)}
+        aria-hidden={blocked}
       >
         <div className="mx-auto flex w-full max-w-container-max-width items-center justify-between px-margin-mobile md:px-margin-desktop">
           <button

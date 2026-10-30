@@ -1,7 +1,7 @@
 // app/proctor/dashboard/page.tsx
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   Bell,
@@ -14,18 +14,20 @@ import {
   History,
   Info,
   Loader2,
+  Lock,
   Menu,
   MessageCircle,
   RotateCcw,
   Send,
   SwitchCamera,
+  Unlock,
   Users,
   Wifi,
   X,
 } from "lucide-react";
 import { useSession } from "@/context/SessionContext";
 import { useProctorSocket } from "@/hooks/useProctorSocket";
-import { FLAG_CATEGORY_META, FlagCategory, FlagSeverity } from "@/lib/gaze";
+import { FLAG_CATEGORY_META, FlagCategory, FlagSeverity, MAX_STRIKES } from "@/lib/gaze";
 import { useNavDrawer } from "../layout";
 
 const QUICK_ALERT_MESSAGE = "Please keep your eyes on the screen and remain in frame.";
@@ -39,6 +41,8 @@ const ALL_CATEGORIES: FlagCategory[] = [
   "tab_switch",
   "tab_away_prolonged",
   "clipboard",
+  "strike",
+  "exam_locked",
   "system",
 ];
 
@@ -95,10 +99,7 @@ const SEVERITY_STYLES: Record<Severity, SeverityStyle> = {
 };
 
 // Event Feed color-coding — driven entirely by the FlagCategory each event
-// carries (set at the source in useGazeMonitor / the tab-switch & clipboard
-// listeners), never by re-parsing the free-text message. This keeps color,
-// icon, and label permanently in sync with how the flag was actually
-// classified when it fired.
+// carries, never by re-parsing the free-text message.
 const CATEGORY_ICONS: Record<FlagCategory, typeof Eye> = {
   no_face: EyeOff,
   multiple_faces: Users,
@@ -108,6 +109,8 @@ const CATEGORY_ICONS: Record<FlagCategory, typeof Eye> = {
   tab_away_prolonged: AlertTriangle,
   clipboard: Clipboard,
   system: Info,
+  strike: AlertTriangle,
+  exam_locked: Lock,
 };
 
 type EventFeedStyle = {
@@ -134,23 +137,23 @@ const SEVERITY_FEED_STYLES: Record<FlagSeverity, EventFeedStyle> = {
   },
 };
 
+type ServerExamState = { locked: boolean; strikes: number };
+
 export default function ProctorDashboardPage() {
   const { session } = useSession();
-  // The nav sidebar itself now lives in app/proctor/layout.tsx (shared
-  // across every /proctor/* page). This page only needs a way to open it
-  // from its own header's hamburger button.
+  // The nav sidebar itself lives in app/proctor/layout.tsx (shared across
+  // every /proctor/* page). This page only needs a way to open it.
   const { setNavOpen } = useNavDrawer();
 
-  // Proctors need a stable clientId too, since Ably tokens are per-clientId.
-  const { registerProctor, connected, connectionError, roster, events, sendAlert } = useProctorSocket(
-    session ? `proctor-${session.studentId}` : null
-  );
+  // Proctors need a stable clientId too; the real identity is bound
+  // server-side from the signed session cookie when the Ably token is minted.
+  const { registerProctor, connected, connectionError, roster, events, sendAlert, sendControl } =
+    useProctorSocket(session ? `proctor-${session.studentId}` : null);
   const [alertDrafts, setAlertDrafts] = useState<Record<string, string>>({});
   const [justSent, setJustSent] = useState<Record<string, boolean>>({});
   // Tracks which event-feed entries the proctor has clicked open to read in
-  // full. Keyed by studentId+timestamp (stable across re-renders) rather
-  // than array index, since new events are prepended and would otherwise
-  // shift which card a given index points at.
+  // full. Keyed by studentId+timestamp rather than array index, since new
+  // events are prepended and would shift which card an index points at.
   const [expandedEvents, setExpandedEvents] = useState<Set<string>>(new Set());
 
   // Event feed filters
@@ -159,19 +162,68 @@ export default function ProctorDashboardPage() {
   const [categoryFilters, setCategoryFilters] = useState<Set<FlagCategory>>(new Set());
   const [categoryPanelOpen, setCategoryPanelOpen] = useState(false);
 
-  // Below the lg breakpoint the event feed becomes a slide-in drawer
-  // instead of a permanent column — there isn't horizontal room for both
-  // fixed panels on a phone. The nav drawer's open state lives in the
-  // shared layout instead (see useNavDrawer above).
+  // Below the lg breakpoint the event feed becomes a slide-in drawer.
   const [feedOpen, setFeedOpen] = useState(false);
 
   const inputRefs = useRef<Record<string, HTMLInputElement | null>>({});
 
+  // ---- exam lock state (server is the source of truth) --------------------
+  const [serverStates, setServerStates] = useState<Record<string, ServerExamState>>({});
+  // Per-student "resume with N strikes" choice shown next to the Unlock button.
+  const [unlockStrikes, setUnlockStrikes] = useState<Record<string, number>>({});
+  const handledLocksRef = useRef<Set<string>>(new Set());
+
+  const refreshStates = useCallback(async () => {
+    try {
+      const res = await fetch("/api/exam/state?all=1", { cache: "no-store" });
+      if (res.ok) setServerStates(((await res.json()).states ?? {}) as Record<string, ServerExamState>);
+    } catch {
+      /* the next poll retries */
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!session) return;
+    refreshStates();
+    const id = setInterval(refreshStates, 4000);
+    return () => clearInterval(id);
+  }, [session, refreshStates]);
+
+  const setExamLock = useCallback(
+    async (studentId: string, action: "lock" | "unlock", strikes?: number) => {
+      try {
+        const res = await fetch("/api/exam/state", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action, studentId, strikes }),
+        });
+        if (!res.ok) throw new Error(String(res.status));
+        // Nudge: the student re-reads its state from the server immediately.
+        sendControl(studentId);
+        refreshStates();
+      } catch (e) {
+        console.error("Lock update failed", e);
+      }
+    },
+    [sendControl, refreshStates]
+  );
+
+  // The proctor-side half of the ban: when an "exam_locked" flag arrives (the
+  // sender is verified by Ably), lock that student on the SERVER too, even if
+  // the student's own report request was blocked or never sent.
+  useEffect(() => {
+    for (const e of events) {
+      if (e.category !== "exam_locked") continue;
+      const key = `${e.studentId}-${e.timestamp}`;
+      if (handledLocksRef.current.has(key)) continue;
+      handledLocksRef.current.add(key);
+      setExamLock(e.studentId, "lock", MAX_STRIKES);
+    }
+  }, [events, setExamLock]);
+
   // Auto-open the feed drawer the first time a critical event comes in, so
-  // a proctor glancing at the student grid on mobile doesn't miss it just
-  // because the drawer happened to be closed. Only fires once per session
-  // — if the proctor closes it again afterward, we don't keep re-opening it
-  // on every subsequent critical event.
+  // a proctor glancing at the student grid on mobile doesn't miss it. Only
+  // fires once per session.
   const hasAutoOpenedFeedRef = useRef(false);
   const prevEventsLengthRef = useRef(0);
 
@@ -260,9 +312,8 @@ export default function ProctorDashboardPage() {
     setCategoryFilters(new Set());
   }
 
-  // Jumping to a student's feed from their card is far more useful on
-  // mobile if it also opens the drawer — otherwise the filter is applied
-  // invisibly behind a closed panel.
+  // Jumping to a student's feed from their card also opens the drawer on
+  // mobile — otherwise the filter is applied invisibly behind a closed panel.
   function filterFeedForStudent(studentId: string) {
     setStudentFilter(studentId);
     setFeedOpen(true);
@@ -285,12 +336,14 @@ export default function ProctorDashboardPage() {
       <div className="min-h-screen flex items-center justify-center bg-background text-destructive text-sm px-6 text-center">
         Realtime connection failed: {connectionError}
         <br />
-        Check that ABLY_API_KEY is set and the dev server was restarted after adding it.
+        Check that ABLY_API_KEY is set, you are logged in as a proctor, and the dev server was restarted after
+        adding env vars.
       </div>
     );
   }
 
   const flaggedCount = roster.reduce((sum, s) => sum + s.flagCount, 0);
+  const lockedCount = roster.reduce((sum, s) => sum + (serverStates[s.studentId]?.locked ? 1 : 0), 0);
 
   const visibleEvents = events.filter(function passesFilter(e) {
     if (studentFilter !== "all" && e.studentId !== studentFilter) return false;
@@ -356,6 +409,14 @@ export default function ProctorDashboardPage() {
                   </span>
                 </>
               )}
+              {lockedCount > 0 && (
+                <>
+                  <span className="text-muted-foreground text-[10px] sm:text-xs">•</span>
+                  <span className="text-destructive text-[10px] sm:text-xs font-bold whitespace-nowrap">
+                    {lockedCount} locked
+                  </span>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -373,6 +434,12 @@ export default function ProctorDashboardPage() {
                 Active Flags
               </span>
               <span className="font-display text-2xl font-semibold text-destructive">{flaggedCount}</span>
+            </div>
+            <div className="flex flex-col items-end">
+              <span className="text-[10px] tracking-widest text-muted-foreground uppercase font-mono">
+                Locked
+              </span>
+              <span className="font-display text-2xl font-semibold text-destructive">{lockedCount}</span>
             </div>
           </div>
           <div className="hidden md:block h-10 w-px bg-border" />
@@ -411,10 +478,14 @@ export default function ProctorDashboardPage() {
         <section className="p-3 sm:p-6 lg:p-10 overflow-y-auto scrollbar-thin flex-1">
           <div className="grid grid-cols-1 xl:grid-cols-2 2xl:grid-cols-3 gap-3 sm:gap-4 lg:gap-6">
             {roster.map(function renderStudentCard(s) {
+              const examState = serverStates[s.studentId];
+              const isLocked = examState?.locked ?? false;
+              const strikeCount = examState?.strikes ?? 0;
+
               const state = s.lastStatus?.result?.state;
-              const severity = severityOf(state);
+              const severity = isLocked ? "critical" : severityOf(state);
               const styles = SEVERITY_STYLES[severity];
-              const CardIcon = styles.icon;
+              const CardIcon = isLocked ? Lock : styles.icon;
               const flagCount = s.flagCount;
               const monitorHref = "/monitor/" + s.studentId;
 
@@ -432,7 +503,7 @@ export default function ProctorDashboardPage() {
                     <div
                       className={`absolute top-2.5 left-2.5 sm:top-3 sm:left-3 ${styles.badgeBg} ${styles.badgeText} px-2 py-1 rounded text-[9px] sm:text-[10px] font-bold uppercase tracking-tight max-w-[70%] truncate`}
                     >
-                      {s.lastStatus?.result?.title ?? "No data yet"}
+                      {isLocked ? "Exam Locked" : s.lastStatus?.result?.title ?? "No data yet"}
                     </div>
                     <span
                       className={`absolute bottom-2.5 right-2.5 sm:bottom-3 sm:right-3 text-[9px] sm:text-[10px] font-mono px-1.5 py-0.5 rounded-md backdrop-blur-md ${
@@ -453,7 +524,12 @@ export default function ProctorDashboardPage() {
                         <span className={`font-mono font-bold text-sm ${styles.dot}`}>
                           {flagCount} Flag{flagCount === 1 ? "" : "s"}
                         </span>
-                        <span className="text-[10px] text-muted-foreground whitespace-nowrap">{styles.label}</span>
+                        <span className="text-[10px] font-mono text-muted-foreground whitespace-nowrap">
+                          Strikes {strikeCount}/{MAX_STRIKES}
+                        </span>
+                        <span className="text-[10px] text-muted-foreground whitespace-nowrap">
+                          {isLocked ? "Exam locked" : styles.label}
+                        </span>
                       </div>
                     </div>
 
@@ -520,6 +596,43 @@ export default function ProctorDashboardPage() {
                         <MessageCircle className="h-3.5 w-3.5" /> Message
                       </button>
                     </div>
+
+                    {/* Exam lock controls — the proctor chooses how many strikes the
+                        student resumes with when re-enabling them. */}
+                    <div className="mt-2 flex items-center gap-2">
+                      {isLocked ? (
+                        <>
+                          <select
+                            value={unlockStrikes[s.studentId] ?? 0}
+                            onChange={(e) =>
+                              setUnlockStrikes((prev) => ({ ...prev, [s.studentId]: Number(e.target.value) }))
+                            }
+                            className="flex-1 min-w-0 rounded-md border border-input bg-background px-2 py-2 text-xs text-foreground outline-none focus:border-accent"
+                          >
+                            {Array.from({ length: MAX_STRIKES }, (_, n) => (
+                              <option key={n} value={n}>
+                                Resume with {n} strike{n === 1 ? "" : "s"}
+                              </option>
+                            ))}
+                          </select>
+                          <button
+                            type="button"
+                            onClick={() => setExamLock(s.studentId, "unlock", unlockStrikes[s.studentId] ?? 0)}
+                            className="flex items-center gap-1.5 rounded-lg bg-accent/15 px-3 py-2 text-xs font-bold text-accent hover:bg-accent/25 active:scale-95 transition-all touch-manipulation"
+                          >
+                            <Unlock className="h-3.5 w-3.5" /> Unlock
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setExamLock(s.studentId, "lock")}
+                          className="flex w-full items-center justify-center gap-1.5 rounded-lg bg-muted py-2 text-xs font-bold text-foreground hover:bg-muted/70 active:scale-95 transition-all touch-manipulation"
+                        >
+                          <Lock className="h-3.5 w-3.5" /> Lock exam
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
               );
@@ -533,9 +646,7 @@ export default function ProctorDashboardPage() {
 
       {/* Right Sidebar: Live Event Feed — permanent column at lg+ (sits
           below the header there), slide-in drawer covering full height
-          (including under the header) below lg. This one is dashboard-
-          specific, so it stays local to this page rather than moving to
-          the shared layout. */}
+          (including under the header) below lg. */}
       <aside
         className={`w-full sm:max-w-sm lg:w-80 fixed right-0 top-0 lg:top-20 h-[100dvh] lg:h-[calc(100vh-5rem)] bg-sidebar border-l border-sidebar-border flex flex-col z-40 transform transition-transform duration-300 ease-out ${
           feedOpen ? "translate-x-0" : "translate-x-full"

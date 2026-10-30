@@ -1,20 +1,42 @@
 // app/api/ably-token/route.ts
 import Ably from "ably";
 import { NextRequest, NextResponse } from "next/server";
+import { SESSION_COOKIE, verifySession } from "@/lib/session";
 
 // ABLY_API_KEY must be set in Vercel project env vars (server-side only —
 // never prefix it with NEXT_PUBLIC_ or it'll be exposed to the client).
+export const dynamic = "force-dynamic";
+
 export async function GET(req: NextRequest) {
   if (!process.env.ABLY_API_KEY) {
     return NextResponse.json({ error: "ABLY_API_KEY is not configured" }, { status: 500 });
   }
 
-  const clientId = req.nextUrl.searchParams.get("clientId");
-  if (!clientId) {
-    return NextResponse.json({ error: "clientId query param is required" }, { status: 400 });
+  // Identity and role come from the signed cookie, never from the query string.
+  const session = verifySession(req.cookies.get(SESSION_COOKIE)?.value);
+  if (!session) {
+    return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
   }
 
+  const capability =
+    session.role === "student"
+      ? {
+          // Publish status/flags and announce presence. Deliberately NO
+          // subscribe, so a student can't read other students' flags.
+          "proctoring-room": ["publish", "presence"],
+          // Only their own alert/control channel, and only to receive.
+          [`alert-${session.id}`]: ["subscribe"],
+        }
+      : {
+          "proctoring-room": ["subscribe", "presence"],
+          "alert-*": ["publish"],
+        };
+
   const client = new Ably.Rest(process.env.ABLY_API_KEY);
-  const tokenRequestData = await client.auth.createTokenRequest({ clientId });
-  return NextResponse.json(tokenRequestData);
+  const tokenRequest = await client.auth.createTokenRequest({
+    clientId: session.id,
+    capability: JSON.stringify(capability),
+    ttl: 60 * 60 * 1000,
+  });
+  return NextResponse.json(tokenRequest, { headers: { "Cache-Control": "no-store" } });
 }
