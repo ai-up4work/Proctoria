@@ -151,7 +151,7 @@ export default function ProctorDashboardPage() {
   // Proctors need a stable clientId too; the real identity is bound
   // server-side from the signed session cookie when the Ably token is minted.
   // Passing null for non-proctors keeps the socket from connecting at all.
-  const { registerProctor, connected, connectionError, roster, events, sendAlert, sendControl } =
+  const { registerProctor, connected, connectionError, channelError, roster, events, sendAlert, sendControl } =
     useProctorSocket(isProctor && session ? `proctor-${session.studentId}` : null);
   const [alertDrafts, setAlertDrafts] = useState<Record<string, string>>({});
   const [justSent, setJustSent] = useState<Record<string, boolean>>({});
@@ -486,6 +486,15 @@ export default function ProctorDashboardPage() {
           that margin around {children}, so adding it again would double
           the offset and push this whole page off past the sidebar. */}
       <main className="min-h-screen flex flex-col relative pt-[4.5rem] lg:pt-20 lg:mr-80">
+        {/* Channel-level realtime problem (e.g. missing Ably capability). The
+            connection can look healthy while a channel is denied, which would
+            otherwise just look like "no students". */}
+        {channelError && (
+          <div className="mx-3 mt-3 rounded-lg border border-destructive/40 bg-destructive/10 p-3 font-mono text-xs text-destructive sm:mx-6 lg:mx-10">
+            Realtime channel problem — {channelError}
+          </div>
+        )}
+
         {/* Bento Grid of Student Cards */}
         <section className="p-3 sm:p-6 lg:p-10 overflow-y-auto scrollbar-thin flex-1">
           <div className="grid grid-cols-1 xl:grid-cols-2 2xl:grid-cols-3 gap-3 sm:gap-4 lg:gap-6">
@@ -650,7 +659,13 @@ export default function ProctorDashboardPage() {
               );
             })}
             {roster.length === 0 && (
-              <p className="text-sm text-muted-foreground col-span-full">No students connected yet.</p>
+              <div className="col-span-full space-y-1 text-sm text-muted-foreground">
+                <p>No students connected yet.</p>
+                <p className="font-mono text-xs">
+                  realtime: {connected ? "connected" : "connecting…"} · role: {session.role} · you: {session.studentId}
+                  {channelError ? ` · error: ${channelError}` : " · no channel errors"}
+                </p>
+              </div>
             )}
           </div>
         </section>
