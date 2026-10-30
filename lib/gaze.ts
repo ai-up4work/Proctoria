@@ -91,7 +91,9 @@ export const FLAG_CATEGORY_META: Record<FlagCategory, FlagCategoryMeta> = {
   multiple_faces: { severity: "critical", label: "Multiple Faces" },
   gaze_away: { severity: "critical", label: "Eyes Off Screen" },
   head_away: { severity: "critical", label: "Head Turned Away" },
-  tab_switch: { severity: "warning", label: "Tab / Window Switch" },
+  // Leaving the exam tab is critical, so it counts toward strikes. One
+  // switch (including its "still away" repeats) is a single incident.
+  tab_switch: { severity: "critical", label: "Tab / Window Switch" },
   // Distinct from a plain tab_switch: this fires once an absence has run
   // long enough that it's no longer "glanced away," it's "left the exam."
   tab_away_prolonged: { severity: "critical", label: "Prolonged Absence" },
