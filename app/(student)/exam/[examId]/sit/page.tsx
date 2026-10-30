@@ -58,7 +58,7 @@ function formatTime(totalSeconds: number) {
 }
 
 export default function ExamSitPage() {
-  const { session } = useSession();
+  const { session, initializing, logout } = useSession();
   const params = useParams<{ examId: string }>();
   const examId = params?.examId ?? "default";
 
@@ -86,6 +86,7 @@ export default function ExamSitPage() {
   const [strikes, setStrikes] = useState(0);
   const [locked, setLocked] = useState(false);
   const [stateReady, setStateReady] = useState(false);
+  const [sessionExpired, setSessionExpired] = useState(false);
   const [strikeModal, setStrikeModal] = useState<{ strike: number; reason: string; label: string } | null>(
     null
   );
@@ -93,6 +94,7 @@ export default function ExamSitPage() {
   const strikesRef = useRef(0);
   const lockedRef = useRef(false);
   const lockPendingRef = useRef(false); // local lock the server hasn't confirmed yet
+  const redirectingRef = useRef(false); // guards against repeated 401 redirects
   const studentIdRef = useRef<string | null>(null);
   studentIdRef.current = session?.studentId ?? null;
   const lastCriticalAtRef = useRef(0);
@@ -101,22 +103,48 @@ export default function ExamSitPage() {
   const lastStatusSentAtRef = useRef(0);
   const lastStatusStateRef = useRef<string | null>(null);
 
-  const reportToServer = useCallback(async (strikesNow: number, lockedNow: boolean) => {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const res = await fetch("/api/exam/state", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "report", strikes: strikesNow, locked: lockedNow }),
-        });
-        if (res.ok) return true;
-      } catch {
-        /* retry below */
+  /**
+   * The server says we have no valid session cookie. Retrying can't fix that,
+   * so stop the camera, show a message, and send the student to log in again.
+   * If your SessionContext keeps the session in localStorage, also clear it
+   * here (e.g. a `clearSession()` from the context) so /login doesn't bounce
+   * the student straight back to this page.
+   */
+  const handleUnauthorized = useCallback(() => {
+    if (redirectingRef.current) return;
+    redirectingRef.current = true;
+    setSessionExpired(true);
+    stopMonitorRef.current();
+    setTimeout(async () => {
+      await logout(); // expires the cookie and clears client state, so /login can't bounce back here
+      window.location.href = "/login?reason=expired";
+    }, 1500);
+  }, [logout]);
+
+  const reportToServer = useCallback(
+    async (strikesNow: number, lockedNow: boolean) => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const res = await fetch("/api/exam/state", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "report", strikes: strikesNow, locked: lockedNow }),
+          });
+          if (res.ok) return true;
+          if (res.status === 401) {
+            handleUnauthorized();
+            return false; // retrying can't fix an invalid session
+          }
+        } catch {
+          /* retry below */
+        }
+        await new Promise((r) => setTimeout(r, 1500));
       }
-      await new Promise((r) => setTimeout(r, 1500));
-    }
-    return false;
-  }, []);
+      return false;
+    },
+    [handleUnauthorized]
+  );
 
   const applyLock = useCallback((strikesNow: number) => {
     lockedRef.current = true; // set BEFORE stopping so the "Camera stopped" flag is dropped
@@ -199,8 +227,13 @@ export default function ExamSitPage() {
 
   /** Pull the authoritative state: restores after refresh, applies proctor lock/unlock. */
   const syncFromServer = useCallback(async () => {
+    if (redirectingRef.current) return;
     try {
-      const res = await fetch("/api/exam/state", { cache: "no-store" });
+      const res = await fetch("/api/exam/state", { cache: "no-store", credentials: "same-origin" });
+      if (res.status === 401) {
+        handleUnauthorized();
+        return;
+      }
       if (!res.ok) return;
       const s = (await res.json()) as { locked: boolean; strikes: number };
 
@@ -224,23 +257,28 @@ export default function ExamSitPage() {
     } catch {
       /* retried by the poll */
     }
-  }, [applyLock]);
+  }, [applyLock, handleUnauthorized]);
 
   const saveAnswer = useCallback(
     async (questionId: string, answer: string) => {
       try {
         const res = await fetch("/api/exam/answer", {
           method: "POST",
+          credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ examId, questionId, answer }),
         });
+        if (res.status === 401) {
+          handleUnauthorized();
+          return;
+        }
         // The server says we're locked -> lock the UI to match.
         if (res.status === 423) syncFromServer();
       } catch {
         /* network blip; the next selection will save again */
       }
     },
-    [examId, syncFromServer]
+    [examId, syncFromServer, handleUnauthorized]
   );
 
   const { videoRef, start, stop, running, modelReady, modelStatus, errorMsg } = useGazeMonitor({
@@ -267,8 +305,8 @@ export default function ExamSitPage() {
   stopMonitorRef.current = stop;
 
   // Questions and navigation are unusable while monitoring is down, the exam
-  // is locked, or the server state hasn't been confirmed yet.
-  const blocked = Boolean(errorMsg) || locked || !stateReady;
+  // is locked, the server state hasn't been confirmed yet, or the session expired.
+  const blocked = Boolean(errorMsg) || locked || !stateReady || sessionExpired;
 
   // Register with the hub once connected.
   useEffect(() => {
@@ -279,18 +317,18 @@ export default function ExamSitPage() {
   // the exam isn't locked. (After an unlock, `locked` flips false and this
   // restarts the camera.)
   useEffect(() => {
-    if (modelReady && stateReady && !locked && !lockedRef.current && !running) start();
-  }, [modelReady, stateReady, locked, running, start]);
+    if (modelReady && stateReady && !locked && !lockedRef.current && !sessionExpired && !running) start();
+  }, [modelReady, stateReady, locked, sessionExpired, running, start]);
 
   // Initial state load + polling. Fast until the first load succeeds, then
   // quick while locked (so an unlock lands fast even if the Ably nudge is
   // missed) and relaxed while the exam is running.
   useEffect(() => {
-    if (!session) return;
+    if (!session || sessionExpired) return;
     syncFromServer();
     const id = setInterval(syncFromServer, !stateReady ? 2000 : locked ? 4000 : 15000);
     return () => clearInterval(id);
-  }, [session, locked, stateReady, syncFromServer]);
+  }, [session, sessionExpired, locked, stateReady, syncFromServer]);
 
   // Proctor "nudge" over Ably -> re-read the server immediately.
   useEffect(() => {
@@ -378,7 +416,7 @@ export default function ExamSitPage() {
         }
         if (hiddenSince !== null) {
           const awaySeconds = Math.round((Date.now() - hiddenSince) / 1000);
-          emitFlag(`Returned to the exam tab after ${awaySeconds}s away.`, Date.now(), "tab_switch");
+          emitFlag(`Returned to the exam tab after ${awaySeconds}s away.`, Date.now(), "system");
           hiddenSince = null;
         }
         // The gaze loop's own onStatus callback resumes publishing fresh
@@ -397,10 +435,10 @@ export default function ExamSitPage() {
   // while the exam is locked, and until the server state is confirmed, so a
   // student can't run the clock out by denying the camera.
   useEffect(() => {
-    if (errorMsg || locked || !stateReady) return;
+    if (errorMsg || locked || !stateReady || sessionExpired) return;
     const id = setInterval(() => setSecondsLeft((s) => Math.max(0, s - 1)), 1000);
     return () => clearInterval(id);
-  }, [errorMsg, locked, stateReady]);
+  }, [errorMsg, locked, stateReady, sessionExpired]);
 
   // Copy/paste restriction inside terminal mode.
   //
@@ -450,6 +488,11 @@ export default function ExamSitPage() {
     };
   }, [session, emitFlag]);
 
+  // Once the server check has finished, no session means "logged out".
+  useEffect(() => {
+    if (!initializing && !session) window.location.href = "/login";
+  }, [initializing, session]);
+
   const question = MOCK_QUESTIONS[current];
   const progressPct = useMemo(() => Math.round(((current + 1) / MOCK_QUESTIONS.length) * 100), [current]);
   const initials = (session?.name || session?.studentId || "?").slice(0, 2).toUpperCase();
@@ -480,6 +523,8 @@ export default function ExamSitPage() {
     start();
   }
 
+  if (initializing) return null; // wait for /api/me before deciding
+
   if (!session) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background text-body-sm text-muted-foreground">
@@ -493,9 +538,33 @@ export default function ExamSitPage() {
       {/* Hidden video element — camera runs, nothing rendered to the student. */}
       <video ref={videoRef} autoPlay playsInline muted className="hidden" />
 
+      {/* Session expired — the server rejected our cookie (401). */}
+      {sessionExpired && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-background p-6">
+          <div className="w-full max-w-md rounded-xl border border-destructive/40 bg-card p-8 text-center shadow-2xl">
+            <span
+              className="material-symbols-outlined mb-4 text-4xl text-destructive"
+              style={{ fontVariationSettings: "'FILL' 1" }}
+            >
+              key_off
+            </span>
+            <h2 className="mb-2 font-display text-headline-md font-bold text-foreground">Session Expired</h2>
+            <p className="mb-4 font-body text-body-sm text-muted-foreground">
+              Your login is no longer valid. Redirecting you to sign in again…
+            </p>
+            <a
+              href="/login?reason=expired"
+              className="inline-block rounded-lg bg-primary px-6 py-3 font-mono text-label-md font-bold text-primary-foreground transition-all hover:brightness-110 active:scale-95"
+            >
+              Go to login
+            </a>
+          </div>
+        </div>
+      )}
+
       {/* Loading gate — nothing is usable until the server confirms whether
           this student is locked, so a refresh can't be used to dodge a ban. */}
-      {!stateReady && (
+      {!stateReady && !sessionExpired && (
         <div className="fixed inset-0 z-[110] flex items-center justify-center bg-background p-6 text-center text-body-sm text-muted-foreground">
           Checking exam status… If this takes more than a few seconds, log in again.
         </div>
@@ -561,7 +630,7 @@ export default function ExamSitPage() {
       {/* Blocking overlay — camera/model failure. The exam is not usable
           until monitoring is restored, so a student can't silently continue
           unproctored. */}
-      {errorMsg && !locked && (
+      {errorMsg && !locked && !sessionExpired && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-background/95 p-6 backdrop-blur-md">
           <div className="w-full max-w-md rounded-xl border border-destructive/40 bg-card p-8 text-center shadow-2xl">
             <span
@@ -629,25 +698,37 @@ export default function ExamSitPage() {
             {/* Monitor status indicator */}
             <div
               className={`hidden items-center gap-2 rounded-full border px-3 py-1.5 sm:flex ${
-                connectionError || errorMsg || locked
+                connectionError || errorMsg || locked || sessionExpired
                   ? "border-destructive/30 bg-destructive/10"
                   : "border-accent/20 bg-muted"
               }`}
             >
               <span
                 className={`material-symbols-outlined text-sm ${
-                  connectionError || errorMsg || locked ? "text-destructive" : "animate-pulse text-accent"
+                  connectionError || errorMsg || locked || sessionExpired
+                    ? "text-destructive"
+                    : "animate-pulse text-accent"
                 }`}
                 style={{ fontVariationSettings: "'FILL' 1" }}
               >
-                {locked ? "lock" : errorMsg ? "videocam_off" : connectionError ? "wifi_off" : "wifi_tethering"}
+                {sessionExpired
+                  ? "key_off"
+                  : locked
+                  ? "lock"
+                  : errorMsg
+                  ? "videocam_off"
+                  : connectionError
+                  ? "wifi_off"
+                  : "wifi_tethering"}
               </span>
               <span
                 className={`font-mono text-label-sm uppercase tracking-widest ${
-                  connectionError || errorMsg || locked ? "text-destructive" : "text-accent"
+                  connectionError || errorMsg || locked || sessionExpired ? "text-destructive" : "text-accent"
                 }`}
               >
-                {locked
+                {sessionExpired
+                  ? "Session Expired"
+                  : locked
                   ? "Exam Locked"
                   : errorMsg
                   ? "Camera Error"

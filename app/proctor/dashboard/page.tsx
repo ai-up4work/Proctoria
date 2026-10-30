@@ -140,15 +140,19 @@ const SEVERITY_FEED_STYLES: Record<FlagSeverity, EventFeedStyle> = {
 type ServerExamState = { locked: boolean; strikes: number };
 
 export default function ProctorDashboardPage() {
-  const { session } = useSession();
+  const { session, initializing } = useSession();
+  // Only a server-verified proctor session may use this page.
+  const isProctor = session?.role === "proctor";
+
   // The nav sidebar itself lives in app/proctor/layout.tsx (shared across
   // every /proctor/* page). This page only needs a way to open it.
   const { setNavOpen } = useNavDrawer();
 
   // Proctors need a stable clientId too; the real identity is bound
   // server-side from the signed session cookie when the Ably token is minted.
+  // Passing null for non-proctors keeps the socket from connecting at all.
   const { registerProctor, connected, connectionError, roster, events, sendAlert, sendControl } =
-    useProctorSocket(session ? `proctor-${session.studentId}` : null);
+    useProctorSocket(isProctor && session ? `proctor-${session.studentId}` : null);
   const [alertDrafts, setAlertDrafts] = useState<Record<string, string>>({});
   const [justSent, setJustSent] = useState<Record<string, boolean>>({});
   // Tracks which event-feed entries the proctor has clicked open to read in
@@ -175,7 +179,9 @@ export default function ProctorDashboardPage() {
 
   const refreshStates = useCallback(async () => {
     try {
-      const res = await fetch("/api/exam/state?all=1", { cache: "no-store" });
+      const res = await fetch("/api/exam/state?all=1", { cache: "no-store", credentials: "same-origin" });
+      // 401/403 means the session is gone or not a proctor; the page-level
+      // gate handles that, so just skip instead of parsing an error body.
       if (res.ok) setServerStates(((await res.json()).states ?? {}) as Record<string, ServerExamState>);
     } catch {
       /* the next poll retries */
@@ -183,17 +189,18 @@ export default function ProctorDashboardPage() {
   }, []);
 
   useEffect(() => {
-    if (!session) return;
+    if (!isProctor) return;
     refreshStates();
     const id = setInterval(refreshStates, 4000);
     return () => clearInterval(id);
-  }, [session, refreshStates]);
+  }, [isProctor, refreshStates]);
 
   const setExamLock = useCallback(
     async (studentId: string, action: "lock" | "unlock", strikes?: number) => {
       try {
         const res = await fetch("/api/exam/state", {
           method: "POST",
+          credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ action, studentId, strikes }),
         });
@@ -212,6 +219,7 @@ export default function ProctorDashboardPage() {
   // sender is verified by Ably), lock that student on the SERVER too, even if
   // the student's own report request was blocked or never sent.
   useEffect(() => {
+    if (!isProctor) return;
     for (const e of events) {
       if (e.category !== "exam_locked") continue;
       const key = `${e.studentId}-${e.timestamp}`;
@@ -219,7 +227,7 @@ export default function ProctorDashboardPage() {
       handledLocksRef.current.add(key);
       setExamLock(e.studentId, "lock", MAX_STRIKES);
     }
-  }, [events, setExamLock]);
+  }, [isProctor, events, setExamLock]);
 
   // Auto-open the feed drawer the first time a critical event comes in, so
   // a proctor glancing at the student grid on mobile doesn't miss it. Only
@@ -241,8 +249,8 @@ export default function ProctorDashboardPage() {
   }, [events]);
 
   useEffect(() => {
-    if (connected) registerProctor();
-  }, [connected, registerProctor]);
+    if (isProctor && connected) registerProctor();
+  }, [isProctor, connected, registerProctor]);
 
   // Lock body scroll while the event feed drawer is open on mobile.
   useEffect(() => {
@@ -319,10 +327,14 @@ export default function ProctorDashboardPage() {
     setFeedOpen(true);
   }
 
-  if (!session) {
+  // Wait for the server to say who we are before deciding anything, so a
+  // refresh doesn't flash "not logged in".
+  if (initializing) return null;
+
+  if (!session || !isProctor) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background text-foreground text-sm px-6 text-center">
-        Not logged in —{" "}
+        {session ? "Proctor access required —" : "Not logged in —"}{" "}
         <a href="/login" className="text-accent underline ml-1">
           go to /login
         </a>{" "}

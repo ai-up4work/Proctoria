@@ -1,38 +1,93 @@
 // app/login/page.tsx
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useSession } from "@/context/SessionContext";
 import Image from "next/image";
 
 type Role = "student" | "proctor";
 
+// Must match ID_PATTERN in lib/session.ts
+const ID_PATTERN = /^[A-Za-z0-9_-]{3,32}$/;
+
+const destinationFor = (role: Role) => (role === "proctor" ? "/proctor/dashboard" : "/exam/demo-exam/sit");
+
 export default function LoginPage() {
   const [idNumber, setIdNumber] = useState("");
   const [name, setName] = useState("");
+  const [passcode, setPasscode] = useState("");
   const [role, setRole] = useState<Role>("student");
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
   const [toast, setToast] = useState(false);
-  const { login } = useSession();
+  const { session, initializing, login } = useSession();
   const router = useRouter();
 
-  const idLooksValid = /^[A-Za-z0-9-]{3,}$/.test(idNumber.trim());
+  const idLooksValid = ID_PATTERN.test(idNumber.trim());
 
-  function handleSubmit(e: React.FormEvent) {
+  // "Your session expired" message when bounced here from the exam page.
+  useEffect(() => {
+    const reason = new URLSearchParams(window.location.search).get("reason");
+    if (reason === "expired") setNotice("Your session expired. Please sign in again.");
+  }, []);
+
+  // Already signed in (verified by the server cookie via /api/me) -> go straight in.
+  // This is also what navigates after a successful login below.
+  useEffect(() => {
+    if (!initializing && session) router.replace(destinationFor(session.role));
+  }, [initializing, session, router]);
+
+  async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (submitting) return;
+
     const trimmed = idNumber.trim();
-    if (!idLooksValid) {
-      setError("Enter a valid ID number (letters, numbers, at least 3 characters).");
+    if (!ID_PATTERN.test(trimmed)) {
+      setError("Enter a valid ID (letters, numbers, - or _, 3 to 32 characters).");
       return;
     }
-    setError(null);
-    setToast(true);
-    setTimeout(() => setToast(false), 2200);
+    if (role === "proctor" && !passcode) {
+      setError("Enter the proctor passcode.");
+      return;
+    }
 
-    login(trimmed, name.trim() || trimmed, role);
-    router.push(role === "proctor" ? "/proctor/dashboard" : "/exam/demo-exam/sit");
+    setError(null);
+    setNotice(null);
+    setSubmitting(true);
+    setToast(true);
+
+    try {
+      // 1. Ask the server to issue the signed session cookie.
+      const res = await fetch("/api/login", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: trimmed, role, passcode: role === "proctor" ? passcode : undefined }),
+      });
+
+      if (!res.ok) {
+        const data = (await res.json().catch(() => null)) as { error?: string } | null;
+        setError(data?.error ?? "Sign-in failed. Please try again.");
+        return;
+      }
+
+      // 2. Confirm the cookie stuck (via /api/me) and populate the context.
+      //    The effect above then redirects to the right page.
+      const verified = await login(trimmed, name.trim() || trimmed, role);
+      if (!verified) {
+        setError("Signed in, but your browser did not keep the session cookie. Check that cookies are enabled.");
+      }
+    } catch {
+      setError("Network error. Please check your connection and try again.");
+    } finally {
+      setSubmitting(false);
+      setTimeout(() => setToast(false), 800);
+    }
   }
+
+  if (initializing) return null; // wait for /api/me so a signed-in user doesn't see the form flash
 
   return (
     <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground font-body">
@@ -56,19 +111,17 @@ export default function LoginPage() {
           {/* soft glow behind the panel */}
           <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,hsl(var(--secondary)/0.12),transparent_60%)]" />
 
-          {/* framed glass panel — mirrors the login card so both halves read as one design */}
-            <div className="w-full max-w-[600px]">
-              <Image
-                src="/logo2.png"
-                alt="Proctoria Logo"
-                width={500}
-                height={500}
-                className="h-auto w-full object-contain"
-                priority
-              />
-            </div>
+          <div className="w-full max-w-[600px]">
+            <Image
+              src="/logo2.png"
+              alt="Proctoria Logo"
+              width={500}
+              height={500}
+              className="h-auto w-full object-contain"
+              priority
+            />
           </div>
-        
+        </div>
 
         {/* Right panel — login form */}
         <main className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-y-auto px-margin-mobile py-margin-tablet md:px-margin-desktop md:py-0">
@@ -133,6 +186,8 @@ export default function LoginPage() {
                       id="id-number"
                       value={idNumber}
                       onChange={(e) => setIdNumber(e.target.value)}
+                      maxLength={32}
+                      autoComplete="username"
                       placeholder={role === "proctor" ? "e.g. proctor1" : "e.g. S1024567"}
                       className="h-11 w-full rounded-lg border border-border bg-input pl-10 pr-10 font-mono text-body-sm text-foreground outline-none transition-all placeholder:text-muted-foreground/60 focus:border-ring focus:ring-2 focus:ring-ring/40"
                     />
@@ -148,6 +203,35 @@ export default function LoginPage() {
                     ID validation active through institutional gateway
                   </p>
                 </div>
+
+                {/* Proctor passcode — required by /api/login for the proctor role */}
+                {role === "proctor" && (
+                  <div className="space-y-1.5">
+                    <label
+                      htmlFor="proctor-passcode"
+                      className="px-1 font-mono text-label-md uppercase tracking-widest text-muted-foreground"
+                    >
+                      Proctor Passcode
+                    </label>
+                    <div className="group relative">
+                      <span
+                        className="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground transition-colors group-focus-within:text-accent"
+                        style={{ fontSize: 18 }}
+                      >
+                        key
+                      </span>
+                      <input
+                        id="proctor-passcode"
+                        type="password"
+                        value={passcode}
+                        onChange={(e) => setPasscode(e.target.value)}
+                        autoComplete="current-password"
+                        placeholder="••••••••"
+                        className="h-11 w-full rounded-lg border border-border bg-input pl-10 pr-3 font-mono text-body-sm text-foreground outline-none transition-all placeholder:text-muted-foreground/60 focus:border-ring focus:ring-2 focus:ring-ring/40"
+                      />
+                    </div>
+                  </div>
+                )}
 
                 {/* Name input */}
                 <div className="space-y-1.5">
@@ -166,16 +250,18 @@ export default function LoginPage() {
                   />
                 </div>
 
+                {notice && !error && <p className="px-1 font-body text-body-sm text-muted-foreground">{notice}</p>}
                 {error && <p className="px-1 font-body text-body-sm text-destructive">{error}</p>}
 
                 <button
                   type="submit"
-                  className="mt-1 flex h-12 w-full items-center justify-center gap-2 rounded-lg border-b-2 border-secondary-foreground/30 bg-secondary font-display text-body-lg font-bold text-secondary-foreground shadow-xl transition-transform duration-150 active:scale-[0.97]"
+                  disabled={submitting}
+                  className="mt-1 flex h-12 w-full items-center justify-center gap-2 rounded-lg border-b-2 border-secondary-foreground/30 bg-secondary font-display text-body-lg font-bold text-secondary-foreground shadow-xl transition-transform duration-150 active:scale-[0.97] disabled:opacity-60"
                 >
                   <span className="material-symbols-outlined" style={{ fontVariationSettings: "'FILL' 1" }}>
                     bolt
                   </span>
-                  Initialize Session
+                  {submitting ? "Authorizing…" : "Initialize Session"}
                 </button>
 
                 <div className="flex items-center justify-between px-1 pt-2">
