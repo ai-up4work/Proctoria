@@ -8,7 +8,7 @@ import { SESSION_COOKIE, verifySession } from "@/lib/session";
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-export async function GET(req: NextRequest) {
+async function handler(req: NextRequest) {
   if (!process.env.ABLY_API_KEY) {
     return NextResponse.json({ error: "ABLY_API_KEY is not configured" }, { status: 500 });
   }
@@ -47,3 +47,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Could not create realtime token" }, { status: 502 });
   }
 }
+
+// Ably's authUrl uses GET by default; exporting POST too means a changed
+// authMethod can never produce a 405.
+export { handler as GET, handler as POST };

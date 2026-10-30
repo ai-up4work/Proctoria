@@ -68,6 +68,7 @@ export default function ExamSitPage() {
     sendFlag,
     connected,
     connectionError,
+    channelError,
     alert,
     clearAlert,
     controlTick,
@@ -768,6 +769,15 @@ export default function ExamSitPage() {
               <span className="material-symbols-outlined text-[18px]">close</span>
             </button>
           </div>
+        </div>
+      )}
+
+      {/* Dev-only realtime diagnostics: the header can say "Monitor Synced" while
+          Ably is down, and strikes still work over HTTP, so surface the truth. */}
+      {process.env.NODE_ENV !== "production" && (!connected || channelError) && (
+        <div className="fixed bottom-24 left-4 z-[60] max-w-sm rounded-md border border-destructive/40 bg-card/95 p-2 font-mono text-[10px] text-destructive">
+          realtime: {connected ? "connected" : connectionError ?? "connecting…"}
+          {channelError ? ` · ${channelError}` : ""}
         </div>
       )}
 
